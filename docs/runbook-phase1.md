@@ -963,9 +963,11 @@ The cert is valid ~9 months. Kubelet rotates it earlier (~80% of TTL), so manual
 For long-running clusters, install [`kubelet-serving-cert-approver`](https://github.com/alex1989hu/kubelet-serving-cert-approver):
 
 ```bash
-helm repo add kubelet-serving-cert-approver https://alex1989hu.github.io/kubelet-serving-cert-approver/
-helm install kubelet-serving-cert-approver kubelet-serving-cert-approver/kubelet-serving-cert-approver \
-  --namespace kubelet-serving-cert-approver --create-namespace
+# Standalone (single replica)
+kubectl apply -f https://raw.githubusercontent.com/alex1989hu/kubelet-serving-cert-approver/main/deploy/standalone-install.yaml
+
+# Or HA (3 replicas with leader election)
+kubectl apply -f https://raw.githubusercontent.com/alex1989hu/kubelet-serving-cert-approver/main/deploy/ha-install.yaml
 ```
 
 It validates each CSR's SANs against the requesting Node's `status.addresses` before approving. Works for both cluster-VPC and satellite nodes.

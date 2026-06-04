@@ -55,8 +55,6 @@ The ASG is tagged for Cluster Autoscaler discovery:
 
 Cluster Autoscaler must be installed separately. It must have permissions in the satellite region (the ASG is in `eu-west-1`, but CA usually runs in the cluster region). See the [CA cross-region docs](https://github.com/kubernetes/autoscaler/tree/master/cluster-autoscaler/cloudprovider/aws#auto-discovery-setup).
 
-For Karpenter instead of CA, skip this script and use a Karpenter `NodePool` — but cross-region Karpenter is non-trivial and out of scope here.
-
 ## Manual scaling
 
 ```bash
