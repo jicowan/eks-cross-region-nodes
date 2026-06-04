@@ -1,0 +1,10 @@
+/xrn-install
+/xrn-install-linux-amd64
+/xrn-install-linux-arm64
+/xrnctl
+/xrnctl-linux-amd64
+/xrnctl-linux-arm64
+*.test
+.vscode
+/docs/checkpoint.md
+/docs/PRD-*
