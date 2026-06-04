@@ -1,6 +1,7 @@
 package patch
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -172,5 +173,86 @@ users:
 	}
 	if !strings.Contains(result, "us-east-2") {
 		t.Errorf("cluster region not set. Got: %s", result)
+	}
+}
+
+func TestApplyAll(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Set up all three target files with realistic nodeadm-generated content
+	envFile := filepath.Join(tmpDir, "environment")
+	configFile := filepath.Join(tmpDir, "config.json")
+	kcFile := filepath.Join(tmpDir, "kubeconfig")
+
+	os.WriteFile(envFile, []byte(`NODEADM_KUBELET_ARGS=--cloud-provider=external --hostname-override=ip-10-1-2-112.eu-west-1.compute.internal --node-labels=eks.amazonaws.com/compute-type=cross-region`), 0644)
+
+	originalConfig := map[string]interface{}{
+		"kind":       "KubeletConfiguration",
+		"providerID": "aws:///eu-west-1b/i-0a5ecec7f33053b35",
+	}
+	data, _ := json.MarshalIndent(originalConfig, "", "    ")
+	os.WriteFile(configFile, data, 0644)
+
+	os.WriteFile(kcFile, []byte(`apiVersion: v1
+users:
+  - name: kubelet
+    user:
+      exec:
+        args:
+          - "--region"
+          - "eu-west-1"
+`), 0644)
+
+	// Override file paths
+	origEnv, origCfg, origKc := kubeletEnvFile, kubeletConfigFile, kubeconfigFile
+	defer func() {
+		setEnvFile(origEnv)
+		setConfigFile(origCfg)
+		setKubeconfigFile(origKc)
+	}()
+	setEnvFile(envFile)
+	setConfigFile(configFile)
+	setKubeconfigFile(kcFile)
+
+	cluster := &discovery.ClusterInfo{Name: "main", Region: "us-east-2"}
+	node := &discovery.NodeMetadata{
+		InstanceID:       "i-0a5ecec7f33053b35",
+		Region:           "eu-west-1",
+		AvailabilityZone: "eu-west-1b",
+	}
+
+	if err := ApplyAll(context.Background(), cluster, node); err != nil {
+		t.Fatalf("ApplyAll failed: %v", err)
+	}
+
+	// Verify env file: cloud-provider, hostname, labels all updated
+	envContent, _ := os.ReadFile(envFile)
+	envStr := string(envContent)
+	if strings.Contains(envStr, "--cloud-provider=external") {
+		t.Errorf("ApplyAll: cloud-provider not changed: %s", envStr)
+	}
+	if !strings.Contains(envStr, "--hostname-override=i-0a5ecec7f33053b35") {
+		t.Errorf("ApplyAll: hostname not changed: %s", envStr)
+	}
+	if !strings.Contains(envStr, "topology.kubernetes.io/zone=eu-west-1b") {
+		t.Errorf("ApplyAll: zone label not added: %s", envStr)
+	}
+
+	// Verify config.json: providerID updated
+	configContent, _ := os.ReadFile(configFile)
+	var resultConfig map[string]interface{}
+	json.Unmarshal(configContent, &resultConfig)
+	wantPID := "eks-hybrid:///us-east-2/main/i-0a5ecec7f33053b35"
+	if resultConfig["providerID"] != wantPID {
+		t.Errorf("ApplyAll: providerID = %v, want %s", resultConfig["providerID"], wantPID)
+	}
+
+	// Verify kubeconfig: region updated
+	kcContent, _ := os.ReadFile(kcFile)
+	if strings.Contains(string(kcContent), `"eu-west-1"`) {
+		t.Errorf("ApplyAll: kubeconfig still has node region: %s", string(kcContent))
+	}
+	if !strings.Contains(string(kcContent), `"us-east-2"`) {
+		t.Errorf("ApplyAll: kubeconfig missing cluster region: %s", string(kcContent))
 	}
 }

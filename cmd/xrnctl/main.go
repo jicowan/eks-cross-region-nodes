@@ -40,18 +40,25 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, `xrnctl — Cross-region EKS cluster admin tool
 
 Usage:
-  xrnctl add-region     --cluster-name NAME --cluster-region REGION --vpc-id VPC --satellite-region REGION [--subnet-ids s1,s2] [--security-group-ids sg1,sg2]
+  xrnctl add-region     --cluster-name NAME --cluster-region REGION --vpc-id VPC --satellite-region REGION [--with-eniconfigs] [--subnet-ids s1,s2] [--security-group-ids sg1,sg2]
   xrnctl remove-region  --cluster-name NAME --cluster-region REGION --vpc-id VPC
   xrnctl list-regions   --cluster-name NAME --cluster-region REGION
   xrnctl verify         --cluster-name NAME --cluster-region REGION
   xrnctl version
 
 Subcommands:
-  add-region      Register a satellite VPC: creates ENIConfigs, updates aws-node-vpc-cidrs ConfigMap
+  add-region      Register a satellite VPC: updates aws-node-vpc-cidrs ConfigMap (and optionally creates ENIConfigs)
   remove-region   Deregister a satellite VPC (refuses if nodes still present)
   list-regions    Show all registered satellite VPCs
-  verify          Check for drift between ConfigMap, ENIConfigs, and actual nodes
+  verify          Check for drift between ConfigMap, ENIConfigs (if any), and actual nodes
   version         Print version
+
+Notes:
+  ENIConfigs (custom networking) are only needed when pods must use a different subnet
+  or security group than the node. By default, add-region does NOT create ENIConfigs —
+  the VPC CNI will allocate pod IPs from the node's primary subnet (auto-discovered
+  via IMDS). Pass --with-eniconfigs to enable custom networking when it is genuinely
+  needed (e.g., pods need a secondary CIDR or different security groups).
 `)
 }
 
@@ -66,6 +73,7 @@ type addRegionConfig struct {
 	SatelliteRegion  string
 	SubnetIDs        []string
 	SecurityGroupIDs []string
+	WithENIConfigs   bool
 }
 
 type removeRegionConfig struct {
@@ -91,6 +99,7 @@ func runAddRegion(ctx context.Context) int {
 		SatelliteRegion:  cfg.SatelliteRegion,
 		SubnetIDs:        cfg.SubnetIDs,
 		SecurityGroupIDs: cfg.SecurityGroupIDs,
+		WithENIConfigs:   cfg.WithENIConfigs,
 	}
 
 	result, err := mgr.AddRegion(ctx, input)
@@ -101,7 +110,23 @@ func runAddRegion(ctx context.Context) int {
 
 	fmt.Printf("✓ Registered satellite VPC %s (region %s)\n", cfg.VPCID, cfg.SatelliteRegion)
 	fmt.Printf("  CIDRs added to ConfigMap: %v\n", result.CIDRs)
-	fmt.Printf("  ENIConfigs created: %v\n", result.ENIConfigNames)
+	if cfg.WithENIConfigs {
+		fmt.Printf("  ENIConfigs created: %v\n", result.ENIConfigNames)
+		fmt.Println("  Note: custom networking must be enabled on the aws-node DaemonSet")
+	} else {
+		fmt.Println("  ENIConfigs: not created (default). Pods will use the node's subnet.")
+		fmt.Println("  To use custom networking instead, re-run with --with-eniconfigs.")
+	}
+	switch result.RemoteNetworkUpdate {
+	case "added":
+		fmt.Println("  RemoteNetworkConfig: updated (cluster is reconciling, may take ~1 minute to return to ACTIVE)")
+		fmt.Println("  WARNING: existing satellite Node objects may be deleted by EKS reconciliation.")
+		fmt.Println("           Restart kubelet on each satellite node to re-register them.")
+	case "already-set":
+		fmt.Println("  RemoteNetworkConfig: already includes these CIDRs (no update)")
+	case "skipped":
+		fmt.Println("  RemoteNetworkConfig: NOT updated (see warning above). kubectl logs/exec to satellite pods will fail until you set it manually.")
+	}
 	return 0
 }
 
@@ -241,6 +266,8 @@ func parseAddRegionFlags() (*addRegionConfig, error) {
 		case "--security-group-ids":
 			i++
 			cfg.SecurityGroupIDs = splitComma(args[i])
+		case "--with-eniconfigs":
+			cfg.WithENIConfigs = true
 		}
 	}
 	if cfg.ClusterName == "" || cfg.ClusterRegion == "" {
@@ -251,6 +278,9 @@ func parseAddRegionFlags() (*addRegionConfig, error) {
 	}
 	if cfg.SatelliteRegion == "" {
 		return nil, fmt.Errorf("--satellite-region is required")
+	}
+	if cfg.WithENIConfigs && len(cfg.SecurityGroupIDs) == 0 {
+		return nil, fmt.Errorf("--security-group-ids is required when --with-eniconfigs is set")
 	}
 	return cfg, nil
 }

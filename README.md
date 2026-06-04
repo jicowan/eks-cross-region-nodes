@@ -30,43 +30,52 @@ xrn-install init --cluster-name my-cluster --cluster-region us-east-2
 - EC2 instance with an IAM role that has a `HYBRID_LINUX` access entry on the target cluster
 - Network connectivity to the cluster API endpoint (TGW/peering + cluster SG rule)
 - AL2023 EKS-optimized AMI with `nodeadm` available
-- ENIConfig CRs already created for this node's AZ
+- (Only if using custom networking) ENIConfig CRs created for this node's AZ via `xrnctl add-region --with-eniconfigs`
 
 ### `xrnctl` (Phase 4)
 
 Cluster-admin tool for managing satellite regions. Runs from an operator workstation with kubectl access to the cluster.
 
 **What it does:**
-- Creates/deletes `ENIConfig` CRs per AZ for satellite VPCs
 - Maintains the `aws-node-vpc-cidrs` ConfigMap (SNAT exclusion CIDRs + registry metadata)
 - Validates CIDR non-overlap when adding a new region
+- Optionally creates/deletes `ENIConfig` CRs (only when custom networking is required)
 - Refuses to remove a region with nodes still registered
 - Detects configuration drift
 
 **Usage:**
 ```bash
-# Register a new satellite VPC
+# Register a new satellite VPC (default: no ENIConfigs, pods use the node's subnet)
+xrnctl add-region \
+  --cluster-name main --cluster-region us-east-2 \
+  --vpc-id vpc-09c3d15c27ab543c5 --satellite-region eu-west-1
+
+# Or with custom networking (pods need a different subnet/SG than the node)
 xrnctl add-region \
   --cluster-name main --cluster-region us-east-2 \
   --vpc-id vpc-09c3d15c27ab543c5 --satellite-region eu-west-1 \
+  --with-eniconfigs \
   --subnet-ids subnet-aaa,subnet-bbb \
   --security-group-ids sg-xxx
 
 # List all registered satellites
 xrnctl list-regions --cluster-name main --cluster-region us-east-2
 
-# Verify consistency (ConfigMap ↔ ENIConfigs ↔ nodes)
+# Verify consistency
 xrnctl verify --cluster-name main --cluster-region us-east-2
 
 # Remove a satellite (fails if nodes still present)
 xrnctl remove-region --cluster-name main --cluster-region us-east-2 --vpc-id vpc-09c3d15c27ab543c5
 ```
 
-**What `add-region` creates:**
-1. One `ENIConfig` per AZ in the satellite VPC (name = AZ name, e.g., `eu-west-1b`)
-2. Updates `kube-system/aws-node-vpc-cidrs` ConfigMap:
-   - `exclude-snat-cidrs` — all VPC CIDRs (cluster + all satellites), newline-separated
-   - `registry.json` — full satellite metadata for verify/remove operations
+**What `add-region` does by default:**
+- Updates `kube-system/aws-node-vpc-cidrs` ConfigMap:
+  - `exclude-snat-cidrs` — all VPC CIDRs (cluster + all satellites), newline-separated
+  - `registry.json` — full satellite metadata for verify/remove operations
+
+**With `--with-eniconfigs`:**
+- Additionally creates one `ENIConfig` per AZ in the satellite VPC (name = AZ name, e.g., `eu-west-1b`)
+- Required only when pods must use a different subnet or security group than the node. For most cross-region setups, the default (no ENIConfigs) is preferred — the VPC CNI auto-discovers the node's subnet via IMDS.
 
 **Prerequisites:**
 - kubectl access to the cluster (kubeconfig configured)
@@ -86,8 +95,8 @@ Before any node can join, the cluster-admin must:
 
 1. Create a `CrossRegionNodeRole` with a `HYBRID_LINUX` access entry on the cluster
 2. Establish network connectivity (TGW/peering + cluster SG allows TCP 443 from satellite VPC)
-3. Enable custom networking on the aws-node DaemonSet
-4. Register the satellite region: `xrnctl add-region --cluster-name <name> --cluster-region <region> --vpc-id <vpc> --satellite-region <region> --subnet-ids <subnets> --security-group-ids <sgs>`
+3. Register the satellite region: `xrnctl add-region --cluster-name <name> --cluster-region <region> --vpc-id <vpc> --satellite-region <region>`
+4. (Only if using custom networking) Add `--with-eniconfigs` to step 3 and enable custom networking on the aws-node DaemonSet
 
 See [docs/runbook-phase1.md](docs/runbook-phase1.md) for the full walkthrough.
 
@@ -167,6 +176,65 @@ When invoked after nodeadm has already bootstrapped:
    - `--node-labels` with `topology.kubernetes.io/zone` and `/region`
    - kubeconfig `--region` set to cluster region (for valid STS token)
 5. Restarts kubelet
+
+
+## Post-join: kubelet serving certificate
+
+After the node joins, `kubectl logs` and `kubectl exec` will fail until the kubelet's serving certificate is approved.
+
+### Why this happens
+
+EKS-optimized AMIs set `serverTLSBootstrap: true` in the kubelet config. On startup, kubelet submits a `kubernetes.io/kubelet-serving` CSR to the cluster and waits for approval before serving HTTPS on port 10250 (the port the control plane uses for `logs`/`exec`).
+
+EKS auto-approves CSRs from cluster-VPC nodes, but **the auto-approver does not approve CSRs from cross-region nodes** — they sit pending forever, kubelet keeps retrying, and the node accumulates dozens of pending CSRs over time. Without an approved cert, kubelet logs show:
+
+```
+http: TLS handshake error from <ip>: no serving certificate available for the kubelet
+```
+
+### Manual approval (one-shot)
+
+```bash
+# Approve all pending CSRs from a specific satellite node
+kubectl get csr -o json | \
+  jq -r '.items[] | select(.spec.username=="system:node:<instance-id>") | select(.status.conditions==null or (.status.conditions|length)==0) | .metadata.name' | \
+  xargs -I {} kubectl certificate approve {}
+
+# Or approve everything pending (use with caution — approves all unprocessed CSRs cluster-wide)
+kubectl get csr -o name | xargs kubectl certificate approve
+```
+
+After approval, kubelet picks up the cert within seconds and `kubectl logs` starts working.
+
+### Permanent fix: deploy an auto-approver
+
+The kubelet rotates its serving cert before expiry (~80% of TTL, default ~9 months). You'll need to re-approve unless you deploy an auto-approver. The community project [`kubelet-serving-cert-approver`](https://github.com/alex1989hu/kubelet-serving-cert-approver) handles this:
+
+```bash
+# Install via Helm
+helm repo add kubelet-serving-cert-approver https://alex1989hu.github.io/kubelet-serving-cert-approver/
+helm install kubelet-serving-cert-approver kubelet-serving-cert-approver/kubelet-serving-cert-approver \
+  --namespace kubelet-serving-cert-approver --create-namespace
+```
+
+It validates each CSR's SANs against the requesting Node's `status.addresses` and approves automatically. Works for cluster-VPC and satellite nodes uniformly.
+
+### Why disabling serverTLSBootstrap is NOT recommended
+
+Setting `serverTLSBootstrap: false` lets kubelet self-sign its serving cert, but the control plane would have to skip TLS verification — `kubectl logs`/`exec` traffic would be unauthenticated TLS. The auto-approver is the right answer.
+
+### Cleanup: clear out the backlog of pending CSRs
+
+If the node has been running for a while without approval, you may have hundreds of pending CSRs:
+
+```bash
+# Delete all pending CSRs (kubelet will re-submit a fresh one)
+kubectl get csr -o json | \
+  jq -r '.items[] | select(.status.conditions==null or (.status.conditions|length)==0) | .metadata.name' | \
+  xargs -I {} kubectl delete csr {}
+```
+
+Then either approve manually (the next CSR kubelet submits) or let the auto-approver handle it.
 
 
 ## Building

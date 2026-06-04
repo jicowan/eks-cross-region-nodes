@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/eks"
+	ekstypes "github.com/aws/aws-sdk-go-v2/service/eks/types"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -53,11 +54,13 @@ type AddRegionInput struct {
 	SatelliteRegion  string
 	SubnetIDs        []string
 	SecurityGroupIDs []string
+	WithENIConfigs   bool
 }
 
 type AddRegionResult struct {
-	CIDRs          []string
-	ENIConfigNames []string
+	CIDRs               []string
+	ENIConfigNames      []string
+	RemoteNetworkUpdate string // "added", "already-set", or "skipped"
 }
 
 type SatelliteRegion struct {
@@ -124,19 +127,20 @@ func (m *Manager) AddRegion(ctx context.Context, input *AddRegionInput) (*AddReg
 		return nil, err
 	}
 
-	// 3. Discover subnets if not provided
-	subnets, err := m.resolveSubnets(ctx, input)
-	if err != nil {
-		return nil, fmt.Errorf("resolving subnets: %w", err)
+	// 3. Optionally create ENIConfigs (only when custom networking is required)
+	var eniConfigNames []string
+	if input.WithENIConfigs {
+		subnets, err := m.resolveSubnets(ctx, input)
+		if err != nil {
+			return nil, fmt.Errorf("resolving subnets: %w", err)
+		}
+		eniConfigNames, err = m.createENIConfigs(ctx, subnets, input.SecurityGroupIDs)
+		if err != nil {
+			return nil, fmt.Errorf("creating ENIConfigs: %w", err)
+		}
 	}
 
-	// 4. Create ENIConfigs
-	eniConfigNames, err := m.createENIConfigs(ctx, subnets, input.SecurityGroupIDs)
-	if err != nil {
-		return nil, fmt.Errorf("creating ENIConfigs: %w", err)
-	}
-
-	// 5. Update ConfigMap
+	// 4. Update ConfigMap
 	satellite := SatelliteRegion{
 		VPCID:          input.VPCID,
 		Region:         input.SatelliteRegion,
@@ -148,10 +152,125 @@ func (m *Manager) AddRegion(ctx context.Context, input *AddRegionInput) (*AddReg
 		return nil, fmt.Errorf("updating ConfigMap: %w", err)
 	}
 
+	// 5. Update cluster RemoteNetworkConfig so the control plane can reach the kubelet
+	remoteNetworkStatus, err := m.updateRemoteNetworkConfig(ctx, cidrs)
+	if err != nil {
+		// Don't fail the whole operation — RemoteNetworkConfig is a best-effort update.
+		// The operator can set it manually if this fails.
+		fmt.Fprintf(os.Stderr, "  warning: failed to update RemoteNetworkConfig: %v\n", err)
+		remoteNetworkStatus = "skipped"
+	}
+
 	return &AddRegionResult{
-		CIDRs:          cidrs,
-		ENIConfigNames: eniConfigNames,
+		CIDRs:               cidrs,
+		ENIConfigNames:      eniConfigNames,
+		RemoteNetworkUpdate: remoteNetworkStatus,
 	}, nil
+}
+
+// updateRemoteNetworkConfig adds the satellite CIDRs to the cluster's RemoteNetworkConfig.
+// Returns "added" if the cluster was updated, "already-set" if all CIDRs were already present,
+// or an error if the update failed.
+//
+// IMPORTANT: Updating RemoteNetworkConfig on a running cluster causes EKS to delete existing
+// satellite Node objects. This is documented in PRD §14. Operators must restart kubelet on
+// affected nodes after this call.
+func (m *Manager) updateRemoteNetworkConfig(ctx context.Context, newCIDRs []string) (string, error) {
+	out, err := m.eksClient.DescribeCluster(ctx, &eks.DescribeClusterInput{
+		Name: aws.String(m.clusterName),
+	})
+	if err != nil {
+		return "", fmt.Errorf("eks:DescribeCluster: %w", err)
+	}
+
+	// Collect existing remote node CIDRs
+	existingNodeCIDRs := make(map[string]bool)
+	if out.Cluster.RemoteNetworkConfig != nil {
+		for _, network := range out.Cluster.RemoteNetworkConfig.RemoteNodeNetworks {
+			for _, cidr := range network.Cidrs {
+				existingNodeCIDRs[cidr] = true
+			}
+		}
+	}
+
+	existingPodCIDRs := make(map[string]bool)
+	if out.Cluster.RemoteNetworkConfig != nil {
+		for _, network := range out.Cluster.RemoteNetworkConfig.RemotePodNetworks {
+			for _, cidr := range network.Cidrs {
+				existingPodCIDRs[cidr] = true
+			}
+		}
+	}
+
+	// Check if all new CIDRs are already present in both lists
+	allNodePresent := true
+	allPodPresent := true
+	for _, cidr := range newCIDRs {
+		if !existingNodeCIDRs[cidr] {
+			allNodePresent = false
+		}
+		if !existingPodCIDRs[cidr] {
+			allPodPresent = false
+		}
+	}
+	if allNodePresent && allPodPresent {
+		return "already-set", nil
+	}
+
+	// Build the merged config — preserve existing CIDRs, add new ones
+	mergedNodeCIDRs := mapKeys(existingNodeCIDRs)
+	mergedPodCIDRs := mapKeys(existingPodCIDRs)
+	for _, cidr := range newCIDRs {
+		if !existingNodeCIDRs[cidr] {
+			mergedNodeCIDRs = append(mergedNodeCIDRs, cidr)
+		}
+		if !existingPodCIDRs[cidr] {
+			mergedPodCIDRs = append(mergedPodCIDRs, cidr)
+		}
+	}
+	sort.Strings(mergedNodeCIDRs)
+	sort.Strings(mergedPodCIDRs)
+
+	_, err = m.eksClient.UpdateClusterConfig(ctx, &eks.UpdateClusterConfigInput{
+		Name: aws.String(m.clusterName),
+		RemoteNetworkConfig: &ekstypes.RemoteNetworkConfigRequest{
+			RemoteNodeNetworks: []ekstypes.RemoteNodeNetwork{{Cidrs: mergedNodeCIDRs}},
+			RemotePodNetworks:  []ekstypes.RemotePodNetwork{{Cidrs: mergedPodCIDRs}},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("eks:UpdateClusterConfig: %w", err)
+	}
+
+	return "added", nil
+}
+
+func mapKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// mergeRemoteNetworkCIDRs merges newCIDRs into existing, returning the merged sorted slice
+// and whether any new CIDRs were added (false = all already present, no update needed).
+// Pure function — extracted for testability.
+func mergeRemoteNetworkCIDRs(existing, newCIDRs []string) (merged []string, changed bool) {
+	set := make(map[string]bool)
+	for _, c := range existing {
+		set[c] = true
+	}
+	changed = false
+	for _, c := range newCIDRs {
+		if !set[c] {
+			set[c] = true
+			changed = true
+		}
+	}
+	merged = mapKeys(set)
+	sort.Strings(merged)
+	return merged, changed
 }
 
 func (m *Manager) RemoveRegion(ctx context.Context, vpcID string) error {

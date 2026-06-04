@@ -888,7 +888,99 @@ Skip this if you can't safely break the route.
 
 ---
 
-## 9. Cleanup
+## 9. Enable `kubectl logs` and `kubectl exec`
+
+After §8 passes, the node is `Ready` and pods run correctly, but `kubectl logs <pod-on-satellite>` and `kubectl exec` will time out. Two extra steps are required to enable the control plane → kubelet path.
+
+### 9.1. Set `RemoteNetworkConfig` on the cluster
+
+By default the EKS control plane only routes to nodes inside the cluster VPC. Tell it the satellite CIDR is reachable:
+
+```bash
+aws eks update-cluster-config --region <region-A> --name <cluster-name> \
+  --remote-network-config '{
+    "remoteNodeNetworks": [{"cidrs": ["10.1.0.0/16"]}],
+    "remotePodNetworks":  [{"cidrs": ["10.1.0.0/16"]}]
+  }'
+
+# Wait for the cluster to return to ACTIVE
+aws eks describe-cluster --region <region-A> --name <cluster-name> \
+  --query 'cluster.status' --output text
+```
+
+> **Heads up:** updating `RemoteNetworkConfig` on a cluster that already has satellite nodes joined causes the existing Node objects to be deleted. Kubelet does NOT auto-re-register; it gets stuck PATCH'ing a missing Node. After the cluster returns to `ACTIVE`, **restart kubelet on each satellite node** to re-register:
+>
+> ```bash
+> aws ssm send-command --region <region-B> \
+>   --instance-ids <instance-id> \
+>   --document-name "AWS-RunShellScript" \
+>   --parameters 'commands=["systemctl restart kubelet"]'
+> ```
+>
+> This is one-time per node. Once you set `RemoteNetworkConfig` *before* joining nodes, this isn't needed.
+
+### 9.2. Approve kubelet-serving CSRs
+
+EKS-optimized AMIs set `serverTLSBootstrap: true`. Kubelet generates a `kubernetes.io/kubelet-serving` CSR and waits for approval before serving HTTPS on port 10250 (the port the control plane uses for `logs`/`exec`/`port-forward`).
+
+EKS auto-approves CSRs from cluster-VPC nodes via internal mechanisms but **does not auto-approve CSRs from cross-region nodes** (verified — the CSRs sit `Pending` indefinitely even with `RemoteNetworkConfig` set).
+
+#### Manual approval (one-shot)
+
+```bash
+# Approve all pending CSRs from a specific satellite node
+NODE_NAME=<instance-id>  # e.g., i-0a5ecec7f33053b35
+kubectl get csr -o json | \
+  jq -r ".items[] | select(.spec.username==\"system:node:$NODE_NAME\") | select(.status.conditions==null or (.status.conditions|length)==0) | .metadata.name" | \
+  xargs -I {} kubectl certificate approve {}
+```
+
+The cert is valid ~9 months. Kubelet rotates it earlier (~80% of TTL), so manual approval recurs.
+
+#### Permanent: deploy a serving cert auto-approver
+
+For long-running clusters, install [`kubelet-serving-cert-approver`](https://github.com/alex1989hu/kubelet-serving-cert-approver):
+
+```bash
+helm repo add kubelet-serving-cert-approver https://alex1989hu.github.io/kubelet-serving-cert-approver/
+helm install kubelet-serving-cert-approver kubelet-serving-cert-approver/kubelet-serving-cert-approver \
+  --namespace kubelet-serving-cert-approver --create-namespace
+```
+
+It validates each CSR's SANs against the requesting Node's `status.addresses` before approving. Works for both cluster-VPC and satellite nodes.
+
+### 9.3. Verify
+
+```bash
+# This should now succeed (was timing out before §9)
+kubectl logs cross-region-canary
+
+# Same for exec
+kubectl exec -it cross-region-canary -- /bin/sh
+```
+
+### Why both fixes are needed
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| TCP connection to kubelet:10250 hangs (no SYN-ACK) | Control plane has no route to satellite CIDR | §9.1 `RemoteNetworkConfig` |
+| TCP connects but TLS handshake fails (`no serving certificate available`) | Kubelet has no approved serving cert | §9.2 CSR approval |
+
+You need both — `RemoteNetworkConfig` alone leaves you with TLS errors; CSR approval alone leaves you with connection timeouts.
+
+### What works without §9
+
+A satellite node without §9 still:
+- Registers and shows `Ready`
+- Runs pods
+- Networks pods (pod IPs, DNS, service connectivity all work)
+- Routes pod traffic via TGW
+
+What breaks without §9: `kubectl logs/exec/port-forward` for pods on the satellite node, and `kubectl top node/pod` for the satellite (metrics-server scrapes via 10250).
+
+---
+
+## 10. Cleanup
 
 ```bash
 # Delete the canary pod

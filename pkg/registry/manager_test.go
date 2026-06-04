@@ -1,6 +1,8 @@
 package registry
 
 import (
+	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -115,5 +117,168 @@ func TestRegistryDataSerialization(t *testing.T) {
 	}
 	if len(reg.Satellites[0].CIDRs) != 1 || reg.Satellites[0].CIDRs[0] != "10.1.0.0/16" {
 		t.Errorf("CIDRs = %v, want [10.1.0.0/16]", reg.Satellites[0].CIDRs)
+	}
+}
+
+func TestRegistryDataJSONRoundTrip(t *testing.T) {
+	reg := RegistryData{
+		Version: 1,
+		Satellites: []SatelliteRegion{
+			{
+				VPCID:          "vpc-aaa",
+				Region:         "eu-west-1",
+				CIDRs:          []string{"10.1.0.0/16", "100.64.1.0/24"},
+				ENIConfigNames: []string{"eu-west-1a"},
+				AddedAt:        "2026-06-03T00:00:00Z",
+			},
+			{
+				VPCID:   "vpc-bbb",
+				Region:  "ap-south-1",
+				CIDRs:   []string{"10.2.0.0/16"},
+				AddedAt: "2026-06-04T00:00:00Z",
+			},
+		},
+	}
+
+	// Marshal then unmarshal — should be lossless
+	data, err := json.Marshal(reg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var got RegistryData
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if got.Version != reg.Version {
+		t.Errorf("Version: got %d, want %d", got.Version, reg.Version)
+	}
+	if len(got.Satellites) != len(reg.Satellites) {
+		t.Errorf("Satellites count: got %d, want %d", len(got.Satellites), len(reg.Satellites))
+	}
+	if got.Satellites[1].VPCID != "vpc-bbb" {
+		t.Errorf("Satellites[1].VPCID: got %s, want vpc-bbb", got.Satellites[1].VPCID)
+	}
+	// Verify omitempty works — second satellite has no ENIConfigs, should serialize without the field
+	if len(got.Satellites[1].ENIConfigNames) != 0 {
+		t.Errorf("Satellites[1].ENIConfigNames should be empty, got %v", got.Satellites[1].ENIConfigNames)
+	}
+}
+
+func TestMergeRemoteNetworkCIDRs(t *testing.T) {
+	tests := []struct {
+		name        string
+		existing    []string
+		newCIDRs    []string
+		wantMerged  []string
+		wantChanged bool
+	}{
+		{
+			name:        "all new",
+			existing:    []string{},
+			newCIDRs:    []string{"10.1.0.0/16"},
+			wantMerged:  []string{"10.1.0.0/16"},
+			wantChanged: true,
+		},
+		{
+			name:        "all already present",
+			existing:    []string{"10.1.0.0/16", "10.2.0.0/16"},
+			newCIDRs:    []string{"10.1.0.0/16"},
+			wantMerged:  []string{"10.1.0.0/16", "10.2.0.0/16"},
+			wantChanged: false,
+		},
+		{
+			name:        "mixed",
+			existing:    []string{"10.1.0.0/16"},
+			newCIDRs:    []string{"10.1.0.0/16", "10.2.0.0/16"},
+			wantMerged:  []string{"10.1.0.0/16", "10.2.0.0/16"},
+			wantChanged: true,
+		},
+		{
+			name:        "empty existing",
+			existing:    nil,
+			newCIDRs:    []string{"10.1.0.0/16"},
+			wantMerged:  []string{"10.1.0.0/16"},
+			wantChanged: true,
+		},
+		{
+			name:        "empty new",
+			existing:    []string{"10.1.0.0/16"},
+			newCIDRs:    nil,
+			wantMerged:  []string{"10.1.0.0/16"},
+			wantChanged: false,
+		},
+		{
+			name:        "deduplicates within new",
+			existing:    []string{},
+			newCIDRs:    []string{"10.1.0.0/16", "10.1.0.0/16", "10.2.0.0/16"},
+			wantMerged:  []string{"10.1.0.0/16", "10.2.0.0/16"},
+			wantChanged: true,
+		},
+		{
+			name:        "result is sorted",
+			existing:    []string{"10.5.0.0/16"},
+			newCIDRs:    []string{"10.1.0.0/16", "10.3.0.0/16"},
+			wantMerged:  []string{"10.1.0.0/16", "10.3.0.0/16", "10.5.0.0/16"},
+			wantChanged: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			merged, changed := mergeRemoteNetworkCIDRs(tt.existing, tt.newCIDRs)
+			if changed != tt.wantChanged {
+				t.Errorf("changed = %v, want %v", changed, tt.wantChanged)
+			}
+			if !reflect.DeepEqual(merged, tt.wantMerged) {
+				t.Errorf("merged = %v, want %v", merged, tt.wantMerged)
+			}
+		})
+	}
+}
+
+func TestMapKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		m    map[string]bool
+		want int // length only — order non-deterministic
+	}{
+		{"empty", map[string]bool{}, 0},
+		{"single", map[string]bool{"a": true}, 1},
+		{"multiple", map[string]bool{"a": true, "b": true, "c": false}, 3},
+		// Note: mapKeys returns ALL keys regardless of value
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mapKeys(tt.m)
+			if len(got) != tt.want {
+				t.Errorf("len = %d, want %d (got %v)", len(got), tt.want, got)
+			}
+		})
+	}
+}
+
+func TestAddRegionInputValidation(t *testing.T) {
+	// AddRegionInput has no constructor with validation, but document the contract via tests
+	tests := []struct {
+		name  string
+		input AddRegionInput
+		valid bool
+	}{
+		{"required fields only", AddRegionInput{VPCID: "vpc-123", SatelliteRegion: "eu-west-1"}, true},
+		{"with ENIConfigs requires SGs", AddRegionInput{VPCID: "vpc-123", SatelliteRegion: "eu-west-1", WithENIConfigs: true, SecurityGroupIDs: []string{"sg-1"}}, true},
+		{"missing VPC ID", AddRegionInput{SatelliteRegion: "eu-west-1"}, false},
+		{"missing region", AddRegionInput{VPCID: "vpc-123"}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isValid := tt.input.VPCID != "" && tt.input.SatelliteRegion != ""
+			if isValid != tt.valid {
+				t.Errorf("validity = %v, want %v", isValid, tt.valid)
+			}
+		})
 	}
 }

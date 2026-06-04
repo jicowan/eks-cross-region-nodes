@@ -80,6 +80,12 @@ func runInit(ctx context.Context) int {
 	// Step 3: Pre-flight checks
 	fmt.Println("[3/4] Running pre-flight checks...")
 	results := preflight.RunAll(ctx, cluster, node)
+
+	// Print warnings (advisory, don't block install)
+	for _, r := range results.Warnings() {
+		fmt.Fprintf(os.Stderr, "  ⚠ WARNING: %s\n    %s\n", r.Name, r.Error)
+	}
+
 	if !results.AllPassed() {
 		fmt.Fprintf(os.Stderr, "\nPre-flight checks failed:\n")
 		for _, r := range results.Failed() {
@@ -87,7 +93,7 @@ func runInit(ctx context.Context) int {
 		}
 		return results.FirstFailedExitCode()
 	}
-	fmt.Println("  All pre-flight checks passed.")
+	fmt.Println("  All blocking pre-flight checks passed.")
 
 	// Step 4: Bootstrap (if needed) and patch
 	fmt.Println("[4/4] Bootstrapping node...")
@@ -137,15 +143,22 @@ func runPreflight(ctx context.Context) int {
 
 	results := preflight.RunAll(ctx, cluster, node)
 	for _, r := range results.All() {
-		if r.Passed {
+		switch {
+		case r.Passed:
 			fmt.Printf("  ✓ %s\n", r.Name)
-		} else {
+		case r.Warning:
+			fmt.Printf("  ⚠ %s: %s\n", r.Name, r.Error)
+		default:
 			fmt.Printf("  ✗ %s: %s\n", r.Name, r.Error)
 		}
 	}
 
 	if results.AllPassed() {
-		fmt.Println("\nAll checks passed.")
+		if len(results.Warnings()) > 0 {
+			fmt.Println("\nAll blocking checks passed (with warnings).")
+		} else {
+			fmt.Println("\nAll checks passed.")
+		}
 		return 0
 	}
 	return results.FirstFailedExitCode()
