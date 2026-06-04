@@ -194,7 +194,11 @@ func checkIMDSHopLimit(ctx context.Context, node *discovery.NodeMetadata) CheckR
 }
 
 func checkAccessEntry(ctx context.Context, cluster *discovery.ClusterInfo, node *discovery.NodeMetadata) CheckResult {
-	r := CheckResult{Name: "HYBRID_LINUX access entry exists for node role", ExitCode: 14}
+	// This check requires eks:ListAccessEntries permission on the node role, which is
+	// not strictly required for the install itself — it's just diagnostic. If access
+	// entries are misconfigured, registration will fail loudly anyway. Make this a
+	// warning, not a blocker.
+	r := CheckResult{Name: "HYBRID_LINUX access entry exists for node role", ExitCode: 14, Warning: true}
 
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(cluster.Region))
 	if err != nil {

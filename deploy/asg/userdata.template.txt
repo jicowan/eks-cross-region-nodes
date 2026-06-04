@@ -1,0 +1,42 @@
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="//"
+
+--//
+Content-Type: application/node.eks.aws
+
+---
+apiVersion: node.eks.aws/v1alpha1
+kind: NodeConfig
+spec:
+  cluster:
+    name: ${CLUSTER_NAME}
+    region: ${CLUSTER_REGION}
+    apiServerEndpoint: ${CLUSTER_ENDPOINT}
+    certificateAuthority: ${CLUSTER_CA}
+    cidr: ${CLUSTER_SERVICE_CIDR}
+  kubelet:
+    flags:
+      - --node-labels=eks.amazonaws.com/compute-type=cross-region
+
+--//
+Content-Type: text/x-shellscript
+
+#!/bin/bash
+set -euo pipefail
+
+# Download xrn-install from the public GitHub release
+# Using /latest/download/ which redirects to the most recent release
+XRN_URL="https://github.com/jicowan/eks-cross-region-nodes/releases/latest/download/xrn-install-linux-amd64"
+
+curl -sLfo /usr/local/bin/xrn-install "$XRN_URL"
+chmod +x /usr/local/bin/xrn-install
+
+# Run xrn-install. This will:
+#   - detect that nodeadm has already bootstrapped (skip nodeadm)
+#   - apply the cross-region kubelet patches (cloud-provider, hostname, providerID, labels, kubeconfig region)
+#   - restart kubelet
+/usr/local/bin/xrn-install init \
+  --cluster-name ${CLUSTER_NAME} \
+  --cluster-region ${CLUSTER_REGION}
+
+--//--
