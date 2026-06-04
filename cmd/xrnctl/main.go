@@ -8,7 +8,9 @@ import (
 	"github.com/aws/eks-cross-region-nodes/pkg/registry"
 )
 
-const version = "0.1.0"
+// version is the default value when not set via -ldflags. Release builds should set this
+// via `go build -ldflags="-X main.version=$(VERSION)"` (see Makefile).
+var version = "dev"
 
 func main() {
 	if len(os.Args) < 2 {

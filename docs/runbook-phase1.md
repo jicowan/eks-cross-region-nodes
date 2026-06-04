@@ -398,6 +398,26 @@ for POLICY in AmazonEKSWorkerNodePolicy AmazonEC2ContainerRegistryReadOnly Amazo
     --policy-arn arn:aws:iam::aws:policy/$POLICY
 done
 
+# Add inline policy for xrn-install pre-flight checks
+# (eks:ListAccessEntries / eks:DescribeAccessEntry are NOT in AmazonEKSWorkerNodePolicy)
+cat > /tmp/xrn-install-preflight.json <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "eks:ListAccessEntries",
+      "eks:DescribeAccessEntry"
+    ],
+    "Resource": "*"
+  }]
+}
+EOF
+aws iam put-role-policy \
+  --role-name CrossRegionNodeRole \
+  --policy-name AllowXrnInstallPreflight \
+  --policy-document file:///tmp/xrn-install-preflight.json
+
 # Create the instance profile and add the role to it
 aws iam create-instance-profile \
   --instance-profile-name CrossRegionNodeProfile
@@ -417,6 +437,7 @@ Policy summary:
 | `AmazonEC2ContainerRegistryReadOnly` | Pull container images from ECR |
 | `AmazonEKS_CNI_Policy` | aws-node ENI/IP management (`ec2:CreateNetworkInterface`, etc.) |
 | `AmazonSSMManagedInstanceCore` | Optional — SSH-less node access via SSM Session Manager |
+| `AllowXrnInstallPreflight` (inline) | `eks:ListAccessEntries` + `eks:DescribeAccessEntry` for `xrn-install`'s preflight check that confirms a `HYBRID_LINUX` access entry exists. The check is a warning (not blocking), but the binary still calls these APIs — without the permission you'll see an AccessDenied warning in the install output. |
 
 ### Add the role to the EKS cluster's access entries
 

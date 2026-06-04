@@ -30,6 +30,12 @@ xrn-install init --cluster-name my-cluster --cluster-region us-east-2
 - EC2 instance with an IAM role that has a `HYBRID_LINUX` access entry on the target cluster
 - Network connectivity to the cluster API endpoint (TGW/peering + cluster SG rule)
 - AL2023 EKS-optimized AMI with `nodeadm` available
+- IAM role attached to the instance must have these AWS-managed policies:
+  - `AmazonEKSWorkerNodePolicy`
+  - `AmazonEC2ContainerRegistryReadOnly`
+  - `AmazonEKS_CNI_Policy`
+  - `AmazonSSMManagedInstanceCore` (optional, for debugging)
+- IAM role must also allow `eks:ListAccessEntries` and `eks:DescribeAccessEntry` (for `xrn-install`'s preflight check). Add as an inline policy — see [docs/runbook-phase1.md §4](docs/runbook-phase1.md#4-iam-for-the-worker-node).
 - (Only if using custom networking) ENIConfig CRs created for this node's AZ via `xrnctl add-region --with-eniconfigs`
 
 ### `xrnctl` (Phase 4)
