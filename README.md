@@ -168,6 +168,41 @@ aws ec2 run-instances --region <satellite-region> \
 
 The node appears in `kubectl get nodes` with its instance ID as the name (e.g., `i-0a5ecec7f33053b35`) within ~90 seconds.
 
+### Step 4: Move from one-off instances to an ASG with autoscaling (recommended)
+
+Step 3 launches a single satellite instance by hand. For production-shaped operation, you'll want an Auto Scaling group fronted by Cluster Autoscaler so satellite capacity scales with workload demand. Two ready-to-run scripts cover this:
+
+| Goal | Path | Docs |
+|---|---|---|
+| Create a satellite ASG + launch template (uses the same user-data pattern as Step 2, but applied via launch template) | `deploy/asg/` | [deploy/asg/README.md](deploy/asg/README.md) |
+| Install Cluster Autoscaler scoped to **only** the satellite ASG (cross-region, EKS Pod Identity auth) | `deploy/cluster-autoscaler/` | [deploy/cluster-autoscaler/README.md](deploy/cluster-autoscaler/README.md) |
+
+**Quick recipe:**
+
+```bash
+# 1. Edit the config block at the top of deploy/asg/create-asg.sh
+#    (cluster name, satellite region, VPC ID, subnet IDs, SG, instance profile, instance type)
+./deploy/asg/create-asg.sh
+
+# 2. Create the IAM role + EKS Pod Identity association for Cluster Autoscaler
+./deploy/cluster-autoscaler/setup-iam.sh
+
+# 3. Deploy Cluster Autoscaler (scoped to the ASG via --nodes=0:3:cross-region-<cluster>-asg)
+kubectl apply -f deploy/cluster-autoscaler/cluster-autoscaler.yaml
+
+# 4. (Optional) Verify scale-up works
+kubectl apply -f deploy/cluster-autoscaler/test-scale.yaml
+kubectl get nodes -l eks.amazonaws.com/compute-type=cross-region -w
+```
+
+After Step 4:
+- New satellite nodes launch automatically via the ASG when pods are Pending
+- Each new instance bootstraps via the same `xrn-install` flow from Step 2 (no manual user-data per instance)
+- CA scales the ASG up to its `max` (set during ASG creation) when there's demand, and back down after `--scale-down-unneeded-time` (default 10m) of idleness
+- CA runs only in the cluster region and only manages the satellite ASG (no risk of it touching other ASGs)
+
+For multi-region satellite topologies (ASGs in 3+ regions), see the "Adding more satellite ASGs" section of [deploy/cluster-autoscaler/README.md](deploy/cluster-autoscaler/README.md).
+
 ### What `xrn-install init` does
 
 When invoked after nodeadm has already bootstrapped:
