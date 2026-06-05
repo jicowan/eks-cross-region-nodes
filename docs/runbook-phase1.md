@@ -7,6 +7,8 @@
 
 This is the proof-of-concept procedure for [PRD-cross-region-nodes.md](./PRD-cross-region-nodes.md) Phase 1. Everything here is done by hand. Phases 2–4 automate this; you should not be running this runbook for production.
 
+> **Label change planned (consistency).** This runbook sets `eks.amazonaws.com/compute-type=cross-region` on satellite nodes. [PRD-cross-account-nodes.md](./PRD-cross-account-nodes.md) Phase 5e migrates to `compute-type=hybrid` so cross-region and cross-account satellites use one label. The current `cross-region` label still works for same-account/cross-region; this is a unification change, not a bug fix.
+
 ---
 
 ## 0. What you are building

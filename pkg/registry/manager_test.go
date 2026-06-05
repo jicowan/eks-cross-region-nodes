@@ -238,6 +238,55 @@ func TestMergeRemoteNetworkCIDRs(t *testing.T) {
 	}
 }
 
+func TestAccountIDFromARN(t *testing.T) {
+	tests := []struct {
+		name    string
+		arn     string
+		want    string
+		wantErr bool
+	}{
+		{"valid cluster arn", "arn:aws:eks:us-east-2:820537372947:cluster/main", "820537372947", false},
+		{"valid gov arn", "arn:aws-us-gov:eks:us-gov-west-1:111122223333:cluster/x", "111122223333", false},
+		{"empty account", "arn:aws:eks:us-east-2::cluster/main", "", true},
+		{"too few parts", "arn:aws:eks", "", true},
+		{"empty string", "", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := accountIDFromARN(tt.arn)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("accountIDFromARN(%q) = %q, want %q", tt.arn, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSatelliteRegionAccountIDOmitEmpty(t *testing.T) {
+	// AccountID should be omitted from JSON when empty (same-account satellites),
+	// and present when set (cross-account).
+	sameAccount := SatelliteRegion{VPCID: "vpc-1", Region: "eu-west-1", CIDRs: []string{"10.1.0.0/16"}, AddedAt: "t"}
+	data, _ := json.Marshal(sameAccount)
+	if string(data) == "" || containsField(data, "account_id") {
+		t.Errorf("empty AccountID should be omitted, got %s", data)
+	}
+
+	crossAccount := SatelliteRegion{VPCID: "vpc-2", Region: "us-west-1", AccountID: "310444902345", CIDRs: []string{"10.2.0.0/16"}, AddedAt: "t"}
+	data, _ = json.Marshal(crossAccount)
+	if !containsField(data, "account_id") {
+		t.Errorf("set AccountID should be present, got %s", data)
+	}
+}
+
+func containsField(data []byte, field string) bool {
+	var m map[string]interface{}
+	json.Unmarshal(data, &m)
+	_, ok := m[field]
+	return ok
+}
+
 func TestMapKeys(t *testing.T) {
 	tests := []struct {
 		name string
