@@ -44,6 +44,7 @@ var eniConfigGVR = schema.GroupVersionResource{
 type Manager struct {
 	clusterName   string
 	clusterRegion string
+	profile       string
 	k8sClient     kubernetes.Interface
 	dynClient     dynamic.Interface
 	eksClient     *eks.Client
@@ -52,6 +53,7 @@ type Manager struct {
 type AddRegionInput struct {
 	VPCID            string
 	SatelliteRegion  string
+	AccountID        string // AWS account the satellite VPC lives in; empty = cluster's own account
 	SubnetIDs        []string
 	SecurityGroupIDs []string
 	WithENIConfigs   bool
@@ -61,11 +63,14 @@ type AddRegionResult struct {
 	CIDRs               []string
 	ENIConfigNames      []string
 	RemoteNetworkUpdate string // "added", "already-set", or "skipped"
+	CrossAccount        bool   // true if the satellite is in a different account than the cluster
+	AlreadyRegistered   bool   // true if this VPC was already in the registry (idempotent re-run)
 }
 
 type SatelliteRegion struct {
 	VPCID          string   `json:"vpc_id"`
 	Region         string   `json:"region"`
+	AccountID      string   `json:"account_id,omitempty"`
 	CIDRs          []string `json:"vpc_cidrs"`
 	ENIConfigNames []string `json:"eniconfig_names,omitempty"`
 	AddedAt        string   `json:"added_at"`
@@ -76,7 +81,9 @@ type RegistryData struct {
 	Satellites []SatelliteRegion `json:"satellites"`
 }
 
-func NewManager(ctx context.Context, clusterName, clusterRegion string) (*Manager, error) {
+// NewManager builds a Manager. profile selects a named AWS profile from the shared
+// config/credentials files; pass "" to use the default credential chain.
+func NewManager(ctx context.Context, clusterName, clusterRegion, profile string) (*Manager, error) {
 	// Load kubeconfig
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	configOverrides := &clientcmd.ConfigOverrides{}
@@ -97,7 +104,7 @@ func NewManager(ctx context.Context, clusterName, clusterRegion string) (*Manage
 		return nil, fmt.Errorf("creating dynamic client: %w", err)
 	}
 
-	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(clusterRegion))
+	awsCfg, err := loadAWSConfig(ctx, clusterRegion, profile)
 	if err != nil {
 		return nil, fmt.Errorf("loading AWS config: %w", err)
 	}
@@ -105,10 +112,20 @@ func NewManager(ctx context.Context, clusterName, clusterRegion string) (*Manage
 	return &Manager{
 		clusterName:   clusterName,
 		clusterRegion: clusterRegion,
+		profile:       profile,
 		k8sClient:     k8sClient,
 		dynClient:     dynClient,
 		eksClient:     eks.NewFromConfig(awsCfg),
 	}, nil
+}
+
+// loadAWSConfig loads an AWS config for the given region, optionally using a named profile.
+func loadAWSConfig(ctx context.Context, region, profile string) (aws.Config, error) {
+	opts := []func(*config.LoadOptions) error{config.WithRegion(region)}
+	if profile != "" {
+		opts = append(opts, config.WithSharedConfigProfile(profile))
+	}
+	return config.LoadDefaultConfig(ctx, opts...)
 }
 
 func (m *Manager) AddRegion(ctx context.Context, input *AddRegionInput) (*AddRegionResult, error) {
@@ -116,6 +133,29 @@ func (m *Manager) AddRegion(ctx context.Context, input *AddRegionInput) (*AddReg
 	cidrs, err := m.getVPCCIDRs(ctx, input.VPCID, input.SatelliteRegion)
 	if err != nil {
 		return nil, fmt.Errorf("getting VPC CIDRs: %w", err)
+	}
+
+	// Idempotency: if this VPC is already registered, this is a re-run. Skip the overlap
+	// check and ConfigMap rewrite (the VPC's own CIDRs are already in the exclude list and
+	// would otherwise look like a self-overlap). Still re-attempt RemoteNetworkConfig in
+	// case a prior run failed that step, then report.
+	alreadyRegistered, err := m.isVPCRegistered(ctx, input.VPCID)
+	if err != nil {
+		return nil, fmt.Errorf("checking existing registration: %w", err)
+	}
+	if alreadyRegistered {
+		remoteNetworkStatus, rerr := m.updateRemoteNetworkConfig(ctx, cidrs)
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "  warning: failed to update RemoteNetworkConfig: %v\n", rerr)
+			remoteNetworkStatus = "skipped"
+		}
+		crossAccount, _ := m.isCrossAccount(ctx, input.AccountID)
+		return &AddRegionResult{
+			CIDRs:               cidrs,
+			RemoteNetworkUpdate: remoteNetworkStatus,
+			CrossAccount:        crossAccount,
+			AlreadyRegistered:   true,
+		}, nil
 	}
 
 	// 2. Check for CIDR overlap with existing entries
@@ -144,6 +184,7 @@ func (m *Manager) AddRegion(ctx context.Context, input *AddRegionInput) (*AddReg
 	satellite := SatelliteRegion{
 		VPCID:          input.VPCID,
 		Region:         input.SatelliteRegion,
+		AccountID:      input.AccountID,
 		CIDRs:          cidrs,
 		ENIConfigNames: eniConfigNames,
 		AddedAt:        time.Now().UTC().Format(time.RFC3339),
@@ -161,16 +202,81 @@ func (m *Manager) AddRegion(ctx context.Context, input *AddRegionInput) (*AddReg
 		remoteNetworkStatus = "skipped"
 	}
 
+	// 6. Determine whether this satellite is cross-account. Same-account satellites ride
+	// the cluster's existing aws-node DaemonSet; cross-account satellites need their own.
+	crossAccount, err := m.isCrossAccount(ctx, input.AccountID)
+	if err != nil {
+		// Non-fatal: default to same-account (the conservative interpretation — no extra DS).
+		fmt.Fprintf(os.Stderr, "  warning: could not determine cluster account, assuming same-account: %v\n", err)
+		crossAccount = false
+	}
+
 	return &AddRegionResult{
 		CIDRs:               cidrs,
 		ENIConfigNames:      eniConfigNames,
 		RemoteNetworkUpdate: remoteNetworkStatus,
+		CrossAccount:        crossAccount,
 	}, nil
 }
 
-// updateRemoteNetworkConfig adds the satellite CIDRs to the cluster's RemoteNetworkConfig.
-// Returns "added" if the cluster was updated, "already-set" if all CIDRs were already present,
-// or an error if the update failed.
+// isVPCRegistered reports whether vpcID is already present in the registry.
+func (m *Manager) isVPCRegistered(ctx context.Context, vpcID string) (bool, error) {
+	reg, err := m.getRegistry(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, s := range reg.Satellites {
+		if s.VPCID == vpcID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// isCrossAccount reports whether satelliteAccountID differs from the cluster's account.
+// An empty satelliteAccountID means "same account as the cluster" (the caller didn't
+// specify one), so it is never cross-account.
+func (m *Manager) isCrossAccount(ctx context.Context, satelliteAccountID string) (bool, error) {
+	if satelliteAccountID == "" {
+		return false, nil
+	}
+	clusterAccountID, err := m.getClusterAccountID(ctx)
+	if err != nil {
+		return false, err
+	}
+	return satelliteAccountID != clusterAccountID, nil
+}
+
+// getClusterAccountID extracts the AWS account ID from the cluster ARN
+// (arn:aws:eks:<region>:<account>:cluster/<name>).
+func (m *Manager) getClusterAccountID(ctx context.Context) (string, error) {
+	out, err := m.eksClient.DescribeCluster(ctx, &eks.DescribeClusterInput{
+		Name: aws.String(m.clusterName),
+	})
+	if err != nil {
+		return "", fmt.Errorf("eks:DescribeCluster: %w", err)
+	}
+	return accountIDFromARN(aws.ToString(out.Cluster.Arn))
+}
+
+// accountIDFromARN extracts the account field (index 4) from an ARN.
+// arn:partition:service:region:account-id:resource → account-id.
+func accountIDFromARN(arn string) (string, error) {
+	parts := strings.Split(arn, ":")
+	if len(parts) < 5 || parts[4] == "" {
+		return "", fmt.Errorf("could not parse account ID from ARN %q", arn)
+	}
+	return parts[4], nil
+}
+
+// updateRemoteNetworkConfig adds the satellite CIDRs to the cluster's
+// RemoteNetworkConfig.remoteNodeNetworks (required for the control plane to reach the
+// kubelet on :10250). Returns "added" if the cluster was updated, "already-set" if all
+// CIDRs were already present, or an error if the update failed.
+//
+// We deliberately manage ONLY remoteNodeNetworks. remotePodNetworks is optional and EKS
+// rejects any CIDR that appears in both lists (InvalidParameterException: "overlaps with
+// already existing CIDR"). Existing remotePodNetworks, if any, are preserved verbatim.
 //
 // IMPORTANT: Updating RemoteNetworkConfig on a running cluster causes EKS to delete existing
 // satellite Node objects. This is documented in PRD §14. Operators must restart kubelet on
@@ -183,60 +289,33 @@ func (m *Manager) updateRemoteNetworkConfig(ctx context.Context, newCIDRs []stri
 		return "", fmt.Errorf("eks:DescribeCluster: %w", err)
 	}
 
-	// Collect existing remote node CIDRs
-	existingNodeCIDRs := make(map[string]bool)
-	if out.Cluster.RemoteNetworkConfig != nil {
-		for _, network := range out.Cluster.RemoteNetworkConfig.RemoteNodeNetworks {
-			for _, cidr := range network.Cidrs {
-				existingNodeCIDRs[cidr] = true
-			}
+	// Collect existing remote node CIDRs.
+	var existingNodeCIDRs []string
+	var existingPodNetworks []ekstypes.RemotePodNetwork
+	if rnc := out.Cluster.RemoteNetworkConfig; rnc != nil {
+		for _, network := range rnc.RemoteNodeNetworks {
+			existingNodeCIDRs = append(existingNodeCIDRs, network.Cidrs...)
 		}
+		// Preserve existing pod networks as-is; we don't manage them.
+		existingPodNetworks = rnc.RemotePodNetworks
 	}
 
-	existingPodCIDRs := make(map[string]bool)
-	if out.Cluster.RemoteNetworkConfig != nil {
-		for _, network := range out.Cluster.RemoteNetworkConfig.RemotePodNetworks {
-			for _, cidr := range network.Cidrs {
-				existingPodCIDRs[cidr] = true
-			}
-		}
-	}
-
-	// Check if all new CIDRs are already present in both lists
-	allNodePresent := true
-	allPodPresent := true
-	for _, cidr := range newCIDRs {
-		if !existingNodeCIDRs[cidr] {
-			allNodePresent = false
-		}
-		if !existingPodCIDRs[cidr] {
-			allPodPresent = false
-		}
-	}
-	if allNodePresent && allPodPresent {
+	mergedNodeCIDRs, changed := mergeRemoteNetworkCIDRs(existingNodeCIDRs, newCIDRs)
+	if !changed {
 		return "already-set", nil
 	}
 
-	// Build the merged config — preserve existing CIDRs, add new ones
-	mergedNodeCIDRs := mapKeys(existingNodeCIDRs)
-	mergedPodCIDRs := mapKeys(existingPodCIDRs)
-	for _, cidr := range newCIDRs {
-		if !existingNodeCIDRs[cidr] {
-			mergedNodeCIDRs = append(mergedNodeCIDRs, cidr)
-		}
-		if !existingPodCIDRs[cidr] {
-			mergedPodCIDRs = append(mergedPodCIDRs, cidr)
-		}
+	req := &ekstypes.RemoteNetworkConfigRequest{
+		RemoteNodeNetworks: []ekstypes.RemoteNodeNetwork{{Cidrs: mergedNodeCIDRs}},
 	}
-	sort.Strings(mergedNodeCIDRs)
-	sort.Strings(mergedPodCIDRs)
+	// Echo back existing pod networks unchanged so the update doesn't drop them.
+	if len(existingPodNetworks) > 0 {
+		req.RemotePodNetworks = existingPodNetworks
+	}
 
 	_, err = m.eksClient.UpdateClusterConfig(ctx, &eks.UpdateClusterConfigInput{
-		Name: aws.String(m.clusterName),
-		RemoteNetworkConfig: &ekstypes.RemoteNetworkConfigRequest{
-			RemoteNodeNetworks: []ekstypes.RemoteNodeNetwork{{Cidrs: mergedNodeCIDRs}},
-			RemotePodNetworks:  []ekstypes.RemotePodNetwork{{Cidrs: mergedPodCIDRs}},
-		},
+		Name:                aws.String(m.clusterName),
+		RemoteNetworkConfig: req,
 	})
 	if err != nil {
 		return "", fmt.Errorf("eks:UpdateClusterConfig: %w", err)
@@ -388,7 +467,7 @@ func (m *Manager) Verify(ctx context.Context) ([]string, error) {
 }
 
 func (m *Manager) getVPCCIDRs(ctx context.Context, vpcID, region string) ([]string, error) {
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	cfg, err := loadAWSConfig(ctx, region, m.profile)
 	if err != nil {
 		return nil, err
 	}
@@ -454,7 +533,7 @@ func (m *Manager) resolveSubnets(ctx context.Context, input *AddRegionInput) ([]
 	}
 
 	// Auto-discover: find all private subnets in the VPC
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(input.SatelliteRegion))
+	cfg, err := loadAWSConfig(ctx, input.SatelliteRegion, m.profile)
 	if err != nil {
 		return nil, err
 	}
@@ -488,7 +567,7 @@ func (m *Manager) resolveSubnets(ctx context.Context, input *AddRegionInput) ([]
 }
 
 func (m *Manager) describeSubnets(ctx context.Context, subnetIDs []string, region string) ([]subnetInfo, error) {
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	cfg, err := loadAWSConfig(ctx, region, m.profile)
 	if err != nil {
 		return nil, err
 	}
@@ -649,7 +728,7 @@ func (m *Manager) getClusterVPCCIDRs(ctx context.Context) ([]string, error) {
 	}
 
 	vpcID := aws.ToString(out.Cluster.ResourcesVpcConfig.VpcId)
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(m.clusterRegion))
+	cfg, err := loadAWSConfig(ctx, m.clusterRegion, m.profile)
 	if err != nil {
 		return nil, err
 	}
