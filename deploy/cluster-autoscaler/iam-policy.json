@@ -28,7 +28,7 @@
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "aws:ResourceTag/k8s.io/cluster-autoscaler/main": "owned"
+          "aws:ResourceTag/k8s.io/cluster-autoscaler/CLUSTER_NAME_PLACEHOLDER": "owned"
         }
       }
     }

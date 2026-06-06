@@ -1,4 +1,8 @@
-# Cluster Autoscaler scoped to ONLY the satellite ASG cross-region-main-asg in eu-west-1.
+# Cluster Autoscaler scoped to ONLY a satellite ASG, in the satellite region.
+#
+# Before applying, edit the two satellite-specific values in the Deployment below (search "EDIT"):
+#   - the --nodes=MIN:MAX:<satellite-asg-name> flag
+#   - the AWS_REGION env var (the satellite region the ASG lives in)
 #
 # Apply order:
 #   1. ./setup-iam.sh           — creates IAM role + Pod Identity association
@@ -147,7 +151,7 @@ spec:
     spec:
       priorityClassName: system-cluster-critical
       serviceAccountName: cluster-autoscaler
-      # Pin CA to cluster-VPC nodes only — never schedule on satellite nodes.
+      # Pin CA to cluster-VPC nodes only — never schedule on satellite nodes (either topology).
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -155,7 +159,7 @@ spec:
             - matchExpressions:
               - key: eks.amazonaws.com/compute-type
                 operator: NotIn
-                values: ["cross-region"]
+                values: ["cross-region", "hybrid"]
       containers:
       # CA 1.36 hasn't been released yet (as of 2026-06). 1.35 supports clusters up to 1.36.
       # Bump this when 1.36 is published: https://github.com/kubernetes/autoscaler/releases
@@ -175,16 +179,17 @@ spec:
         - --cloud-provider=aws
         - --skip-nodes-with-local-storage=false
         - --expander=least-waste
-        # Explicit ASG list — NOT auto-discovery. Format: MIN:MAX:ASG_NAME.
-        # Add more --nodes flags here when adding more satellite ASGs.
-        - --nodes=0:3:cross-region-main-asg
+        # EDIT: explicit ASG list — NOT auto-discovery. Format: MIN:MAX:ASG_NAME.
+        # Replace with your satellite ASG name (deploy/asg/create-asg.sh names it
+        # cross-region-<cluster>-asg). Add more --nodes flags for additional ASGs in this region.
+        - --nodes=0:3:cross-region-<cluster>-asg
         - --balance-similar-node-groups
         - --skip-nodes-with-system-pods=false
-        # AWS_REGION below tells CA which region to call EC2/ASG APIs in.
-        # Since the ASG is in eu-west-1, point CA there even though CA itself runs in us-east-2.
+        # EDIT: AWS_REGION tells CA which region to call EC2/ASG APIs in — set it to the
+        # SATELLITE region (where the ASG lives), even though CA itself runs in the cluster region.
         env:
         - name: AWS_REGION
-          value: eu-west-1
+          value: <satellite-region>
         volumeMounts:
         - name: ssl-certs
           mountPath: /etc/ssl/certs/ca-certificates.crt

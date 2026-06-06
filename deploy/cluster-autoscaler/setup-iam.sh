@@ -3,9 +3,14 @@
 # kube-system/cluster-autoscaler service account via EKS Pod Identity.
 #
 # Run this BEFORE applying cluster-autoscaler.yaml.
+#
+# Edit the configuration below for your cluster. CLUSTER_NAME is also substituted into the
+# scaling policy's tag condition (k8s.io/cluster-autoscaler/<CLUSTER_NAME>=owned), so it must
+# match the tag on your satellite ASG (deploy/asg/create-asg.sh sets that tag automatically).
 
 set -euo pipefail
 
+# ---- Configuration (edit these) ----
 CLUSTER_NAME="main"
 CLUSTER_REGION="us-east-2"
 ROLE_NAME="ClusterAutoscalerRole"
@@ -36,12 +41,17 @@ else
     --assume-role-policy-document file:///tmp/ca-trust-policy.json >/dev/null
 fi
 
-# 2. Attach the policy
-echo "[2/4] Attaching policy $POLICY_NAME..."
+# 2. Attach the policy. The scaling-action statement is scoped by the tag
+#    k8s.io/cluster-autoscaler/<CLUSTER_NAME>=owned, so substitute CLUSTER_NAME into the policy
+#    template before applying.
+echo "[2/4] Attaching policy $POLICY_NAME (scoped to k8s.io/cluster-autoscaler/${CLUSTER_NAME}=owned)..."
+RENDERED_POLICY=$(mktemp)
+trap "rm -f /tmp/ca-trust-policy.json $RENDERED_POLICY" EXIT
+sed "s|CLUSTER_NAME_PLACEHOLDER|${CLUSTER_NAME}|g" "$SCRIPT_DIR/iam-policy.json" > "$RENDERED_POLICY"
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
   --policy-name "$POLICY_NAME" \
-  --policy-document "file://$SCRIPT_DIR/iam-policy.json"
+  --policy-document "file://$RENDERED_POLICY"
 
 # 3. Verify the eks-pod-identity-agent addon is installed (Pod Identity requires it)
 echo "[3/4] Verifying eks-pod-identity-agent addon..."
