@@ -134,6 +134,11 @@ why the satellite instance assumes `XrnSatelliteNodeRole` rather than holding th
 **VPC CNI / IPAMD:** uses the satellite-account instance role via IMDS (no Pod Identity), calling
 EC2 in the satellite region directly. No cross-account hop.
 
+**Application pods needing AWS access in the satellite account** use cross-account Pod Identity
+(`--target-role-arn`), not IMDS. A plain Pod Identity association on a cross-account node returns
+*cluster-account* credentials, which is usually the wrong account — see
+[pod-identity-cross-account.md](./pod-identity-cross-account.md) for the full explanation and setup.
+
 `xrnctl setup-iam` provisions this whole chain across two profile-scoped runs (see user guide):
 satellite-account run creates `XrnNodeRole` + instance profile + the AssumeRole grant; cluster
 account run creates `XrnSatelliteNodeRole` with the cross-account trust + `eks:DescribeCluster` + the
