@@ -160,6 +160,21 @@ This means:
 - The `compute-type=hybrid` label's role in the cross-account path is about **DaemonSet routing** (keeping cross-account nodes off the Pod-Identity-bound stock aws-node), NOT about pacifying CCM. CCM is pacified by the providerID in both cases.
 - The cross-account pre-kubelet boothook (XA-1) matters because cross-account has a *tighter* timing constraint and a credential problem, not because same-account's post-boot order is wrong.
 
+## 5d. Cross-account phase built (2026-06-05, branch `feature/cross-account-nodes`)
+
+Both tracks landed, back-to-back, all unit-tested. Not yet live-tested end-to-end.
+
+**Track A — CNI:**
+- **XA-5** `pkg/satellite`: `Render(Params)` produces SA + ClusterRoleBinding + DaemonSet (`aws-node-satellite-<acct>-<region>`) from the validated lab manifest. No Pod Identity SA; nodeAffinity scoped to compute-type=hybrid + satellite-account + region; AWS_REGION + SNAT CIDRs baked in; image registry/tags overridable. 93% coverage; output validated by `kubectl apply --dry-run=client` against the real API server.
+- **XA-6** cross-account branch of `add-satellite`: when `--account-id != cluster account`, renders + applies the satellite DS via the dynamic client (create-or-update/idempotent); `--dry-run` prints instead. Same-account path unchanged. **Dropped the planned "patch stock aws-node NotIn" step** — stock aws-node already excludes compute-type=hybrid, so no mutation of the EKS-managed DS is needed.
+
+**Track B — node bootstrap:**
+- **XA-2** `pkg/patch`: `RenderCredentialHelper` (pure) + `installCredentialHelper` write the AssumeRole helper (session name = instance ID) and rewrite the kubeconfig exec to use it. `ApplyAll` gained a `*CrossAccount` param; same-account path (nil) is byte-for-byte unchanged.
+- **XA-7** `cmd/xrn-install`: `--cluster-account-role-arn` + `--cluster-account-external-id` flags; `resolveCrossAccount` auto-detects account mismatch (instance acct vs cluster acct from ARN) and errors with a copy-pasteable hint if the flag is missing. `pkg/discovery` now exposes the cluster ARN + account.
+- **XA-1** pre-kubelet ordering via **ExecStartPre-as-gate** (cleaner than the lab's separate-service-plus-sentinel): new `xrn-install patch` subcommand (discover + patch only, no nodeadm, no restart) is invoked from a kubelet `ExecStartPre` drop-in laid down by a cloud-boothook. kubelet's own `After=nodeadm-config` ordering is the gate. New `deploy/asg/userdata-cross-account.template.txt` + `README-cross-account.md`.
+
+**Still owed:** end-to-end live test of a cross-account node through the full toolchain (setup-iam two-profile → add-satellite → ASG with the cross-account userdata). The `setup-iam --profile root` flow has not been run live yet.
+
 ## 6. Non-gaps (things the PRDs call for that ARE done)
 
 - ConfigMap as canonical registry (not SSM) — done, matches PRD §5 decision.

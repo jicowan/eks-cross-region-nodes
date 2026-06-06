@@ -262,8 +262,8 @@ func TestSplitComma(t *testing.T) {
 		{"", nil},
 		{"a", []string{"a"}},
 		{"a,b,c", []string{"a", "b", "c"}},
-		{"a,,b", []string{"a", "b"}},  // empty segments dropped
-		{",a,", []string{"a"}},        // leading/trailing commas dropped
+		{"a,,b", []string{"a", "b"}}, // empty segments dropped
+		{",a,", []string{"a"}},       // leading/trailing commas dropped
 	}
 	for _, tt := range tests {
 		t.Run(tt.in, func(t *testing.T) {

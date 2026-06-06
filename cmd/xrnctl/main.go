@@ -46,7 +46,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, `xrnctl — Cross-region / cross-account EKS cluster admin tool
 
 Usage:
-  xrnctl add-satellite     --cluster-name NAME --cluster-region REGION --vpc-id VPC --satellite-region REGION [--account-id ACCT] [--with-eniconfigs] [--subnet-ids s1,s2] [--security-group-ids sg1,sg2]
+  xrnctl add-satellite     --cluster-name NAME --cluster-region REGION --vpc-id VPC --satellite-region REGION [--account-id ACCT] [--dry-run] [--with-eniconfigs] [--subnet-ids s1,s2] [--security-group-ids sg1,sg2]
   xrnctl remove-satellite  --cluster-name NAME --cluster-region REGION --vpc-id VPC
   xrnctl list-satellites   --cluster-name NAME --cluster-region REGION
   xrnctl setup-iam         --cluster-name NAME --cluster-region REGION [--node-role-name NAME] [--node-role-arn ARN] [--node-role-only|--access-entry-only] [--profile PROFILE]
@@ -71,7 +71,10 @@ Notes:
   --account-id identifies the AWS account the satellite VPC lives in. Omit it (or set it
   to the cluster's own account) for same-account / cross-region satellites — those ride the
   cluster's existing aws-node DaemonSet. Set it to a DIFFERENT account for cross-account
-  satellites, which require their own aws-node DaemonSet (handled separately).
+  satellites: add-satellite then renders and applies a dedicated aws-node-satellite-<acct>-<region>
+  DaemonSet (whose ServiceAccount has no Pod Identity association, so the CNI uses the
+  satellite-account instance role via IMDS). Use --dry-run to print that manifest instead of
+  applying it.
 
   setup-iam (same-account): run once (default profile) — creates the node role + instance
   profile AND the HYBRID_LINUX access entry in one go.
@@ -101,6 +104,7 @@ type addSatelliteConfig struct {
 	SubnetIDs        []string
 	SecurityGroupIDs []string
 	WithENIConfigs   bool
+	DryRun           bool
 }
 
 type removeSatelliteConfig struct {
@@ -128,6 +132,7 @@ func runAddSatellite(ctx context.Context) int {
 		SubnetIDs:        cfg.SubnetIDs,
 		SecurityGroupIDs: cfg.SecurityGroupIDs,
 		WithENIConfigs:   cfg.WithENIConfigs,
+		DryRun:           cfg.DryRun,
 	}
 
 	result, err := mgr.AddRegion(ctx, input)
@@ -144,6 +149,13 @@ func runAddSatellite(ctx context.Context) int {
 	fmt.Printf("  CIDRs: %v\n", result.CIDRs)
 	if result.CrossAccount {
 		fmt.Printf("  Account: %s (cross-account — requires a dedicated aws-node DaemonSet)\n", cfg.AccountID)
+		if cfg.DryRun {
+			fmt.Printf("  Satellite DaemonSet: %s (DRY RUN — not applied)\n", result.SatelliteDS)
+			fmt.Println("  --- rendered manifest below; apply with: kubectl apply -f - ---")
+			fmt.Println(result.SatelliteManifest)
+		} else {
+			fmt.Printf("  Satellite DaemonSet: %s (applied)\n", result.SatelliteDS)
+		}
 	} else {
 		fmt.Println("  Account: same as cluster (rides the existing aws-node DaemonSet)")
 	}
@@ -383,6 +395,8 @@ func parseAddSatelliteFlags() (*addSatelliteConfig, error) {
 			cfg.SecurityGroupIDs = splitComma(argValue(args, i))
 		case "--with-eniconfigs":
 			cfg.WithENIConfigs = true
+		case "--dry-run":
+			cfg.DryRun = true
 		default:
 			return nil, fmt.Errorf("unknown flag: %s", args[i])
 		}

@@ -16,10 +16,13 @@ import (
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/eks"
 	ekstypes "github.com/aws/aws-sdk-go-v2/service/eks/types"
+	"github.com/aws/eks-cross-region-nodes/pkg/satellite"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -57,6 +60,7 @@ type AddRegionInput struct {
 	SubnetIDs        []string
 	SecurityGroupIDs []string
 	WithENIConfigs   bool
+	DryRun           bool // if true, render the cross-account satellite DS but don't apply it
 }
 
 type AddRegionResult struct {
@@ -65,6 +69,8 @@ type AddRegionResult struct {
 	RemoteNetworkUpdate string // "added", "already-set", or "skipped"
 	CrossAccount        bool   // true if the satellite is in a different account than the cluster
 	AlreadyRegistered   bool   // true if this VPC was already in the registry (idempotent re-run)
+	SatelliteDS         string // name of the rendered/applied aws-node-satellite DaemonSet (cross-account only)
+	SatelliteManifest   string // rendered manifest YAML, populated on DryRun
 }
 
 type SatelliteRegion struct {
@@ -181,7 +187,7 @@ func (m *Manager) AddRegion(ctx context.Context, input *AddRegionInput) (*AddReg
 	}
 
 	// 4. Update ConfigMap
-	satellite := SatelliteRegion{
+	sat := SatelliteRegion{
 		VPCID:          input.VPCID,
 		Region:         input.SatelliteRegion,
 		AccountID:      input.AccountID,
@@ -189,7 +195,7 @@ func (m *Manager) AddRegion(ctx context.Context, input *AddRegionInput) (*AddReg
 		ENIConfigNames: eniConfigNames,
 		AddedAt:        time.Now().UTC().Format(time.RFC3339),
 	}
-	if err := m.updateConfigMap(ctx, satellite, true); err != nil {
+	if err := m.updateConfigMap(ctx, sat, true); err != nil {
 		return nil, fmt.Errorf("updating ConfigMap: %w", err)
 	}
 
@@ -211,12 +217,107 @@ func (m *Manager) AddRegion(ctx context.Context, input *AddRegionInput) (*AddReg
 		crossAccount = false
 	}
 
-	return &AddRegionResult{
+	result := &AddRegionResult{
 		CIDRs:               cidrs,
 		ENIConfigNames:      eniConfigNames,
 		RemoteNetworkUpdate: remoteNetworkStatus,
 		CrossAccount:        crossAccount,
-	}, nil
+	}
+
+	// 7. Cross-account only: render (and apply, unless dry-run) a dedicated aws-node-satellite
+	// DaemonSet. Stock aws-node already excludes compute-type=hybrid nodes, so no patch to it
+	// is needed. Same-account satellites ride stock aws-node and skip this entirely.
+	if crossAccount {
+		manifest, derr := satellite.Render(satellite.Params{
+			AccountID:        input.AccountID,
+			Region:           input.SatelliteRegion,
+			ClusterName:      m.clusterName,
+			ExcludeSNATCIDRs: m.allExcludeSNATCIDRs(ctx),
+		})
+		if derr != nil {
+			return nil, fmt.Errorf("rendering satellite DaemonSet: %w", derr)
+		}
+		result.SatelliteDS = satellite.Params{AccountID: input.AccountID, Region: input.SatelliteRegion}.Name()
+		if input.DryRun {
+			result.SatelliteManifest = manifest
+		} else if aerr := m.applyManifest(ctx, manifest); aerr != nil {
+			return nil, fmt.Errorf("applying satellite DaemonSet: %w", aerr)
+		}
+	}
+
+	return result, nil
+}
+
+// allExcludeSNATCIDRs returns the full SNAT-exclusion CIDR set (cluster + all registered
+// satellites) currently in the ConfigMap, for baking into the satellite DS env. Best-effort:
+// returns whatever it can read.
+func (m *Manager) allExcludeSNATCIDRs(ctx context.Context) []string {
+	cidrs, _ := m.getExistingCIDRs(ctx)
+	return cidrs
+}
+
+// manifestGVRs maps the kinds emitted by pkg/satellite to their GroupVersionResource and
+// whether they're namespaced. We only ever apply these three kinds.
+var manifestGVRs = map[string]struct {
+	gvr        schema.GroupVersionResource
+	namespaced bool
+}{
+	"ServiceAccount":     {schema.GroupVersionResource{Group: "", Version: "v1", Resource: "serviceaccounts"}, true},
+	"DaemonSet":          {schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "daemonsets"}, true},
+	"ClusterRoleBinding": {schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}, false},
+}
+
+// applyManifest decodes a multi-document YAML manifest and creates or updates each object
+// via the dynamic client. Idempotent: existing objects are updated (preserving
+// resourceVersion), missing ones are created.
+func (m *Manager) applyManifest(ctx context.Context, manifest string) error {
+	for _, doc := range strings.Split(manifest, "\n---\n") {
+		doc = strings.TrimSpace(doc)
+		if doc == "" {
+			continue
+		}
+		obj := &unstructured.Unstructured{}
+		if err := yaml.Unmarshal([]byte(doc), &obj.Object); err != nil {
+			return fmt.Errorf("decoding manifest document: %w", err)
+		}
+		if len(obj.Object) == 0 {
+			continue
+		}
+
+		kind := obj.GetKind()
+		mapping, ok := manifestGVRs[kind]
+		if !ok {
+			return fmt.Errorf("unsupported kind in satellite manifest: %q", kind)
+		}
+
+		var ri dynamic.ResourceInterface
+		if mapping.namespaced {
+			ns := obj.GetNamespace()
+			if ns == "" {
+				ns = configMapNamespace
+			}
+			ri = m.dynClient.Resource(mapping.gvr).Namespace(ns)
+		} else {
+			ri = m.dynClient.Resource(mapping.gvr)
+		}
+
+		existing, err := ri.Get(ctx, obj.GetName(), metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			if _, cerr := ri.Create(ctx, obj, metav1.CreateOptions{}); cerr != nil {
+				return fmt.Errorf("creating %s/%s: %w", kind, obj.GetName(), cerr)
+			}
+			continue
+		} else if err != nil {
+			return fmt.Errorf("getting %s/%s: %w", kind, obj.GetName(), err)
+		}
+
+		// Update: carry over resourceVersion so the update is accepted.
+		obj.SetResourceVersion(existing.GetResourceVersion())
+		if _, uerr := ri.Update(ctx, obj, metav1.UpdateOptions{}); uerr != nil {
+			return fmt.Errorf("updating %s/%s: %w", kind, obj.GetName(), uerr)
+		}
+	}
+	return nil
 }
 
 // isVPCRegistered reports whether vpcID is already present in the registry.
