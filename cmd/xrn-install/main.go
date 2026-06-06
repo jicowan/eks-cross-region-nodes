@@ -26,6 +26,8 @@ func main() {
 	switch os.Args[1] {
 	case "init":
 		os.Exit(runInit(ctx))
+	case "patch":
+		os.Exit(runPatch(ctx))
 	case "preflight":
 		os.Exit(runPreflight(ctx))
 	case "discover":
@@ -43,16 +45,26 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, `xrn-install — Cross-region EKS node installer
 
 Usage:
-  xrn-install init       --cluster-name NAME --cluster-region REGION
+  xrn-install init       --cluster-name NAME --cluster-region REGION [--cluster-account-role-arn ARN] [--cluster-account-external-id ID]
   xrn-install preflight  --cluster-name NAME --cluster-region REGION
   xrn-install discover   --cluster-name NAME --cluster-region REGION
   xrn-install version
 
 Subcommands:
-  init        Bootstrap this node into a cross-region EKS cluster (discovery + preflight + nodeadm + patch)
+  init        Bootstrap this node into a cross-region EKS cluster (discovery + preflight + nodeadm + patch + restart)
+  patch       Apply the kubelet patches only (no nodeadm, no restart). For the pre-kubelet
+              boothook flow: run from a kubelet.service ExecStartPre so the first kubelet
+              start already has the correct config. Required for cross-account nodes.
   preflight   Run pre-flight checks only, exit 0 if all pass
   discover    Print discovered cluster config as JSON without applying
   version     Print version
+
+Cross-account:
+  When the node's account differs from the cluster's account, pass
+  --cluster-account-role-arn — the role (in the cluster account) the instance assumes for
+  kubelet credentials (e.g. arn:aws:iam::<cluster-acct>:role/XrnSatelliteNodeRole). The
+  installer auto-detects the account mismatch and errors with a hint if the flag is missing.
+  --cluster-account-external-id is optional (sts:ExternalId on the AssumeRole).
 `)
 }
 
@@ -108,8 +120,18 @@ func runInit(ctx context.Context) int {
 		fmt.Println("  nodeadm already ran (kubeconfig exists), skipping bootstrap.")
 	}
 
-	fmt.Println("  Patching kubelet configuration for cross-region...")
-	if err := patch.ApplyAll(ctx, cluster, node); err != nil {
+	xacct, err := resolveCrossAccount(cfg, cluster, node)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 14
+	}
+	if xacct != nil {
+		fmt.Printf("  Cross-account detected: assuming %s for kubelet credentials.\n", xacct.SatelliteRoleARN)
+		fmt.Println("  Patching kubelet configuration for cross-region (with AssumeRole credential helper)...")
+	} else {
+		fmt.Println("  Patching kubelet configuration for cross-region...")
+	}
+	if err := patch.ApplyAll(ctx, cluster, node, xacct); err != nil {
 		fmt.Fprintf(os.Stderr, "error: patch failed: %v\n", err)
 		return 1
 	}
@@ -121,6 +143,44 @@ func runInit(ctx context.Context) int {
 	}
 
 	fmt.Printf("\n✓ Node %s successfully bootstrapped into cluster %s (region %s)\n", node.InstanceID, cfg.ClusterName, cfg.ClusterRegion)
+	return 0
+}
+
+// runPatch applies the cross-region kubelet patches WITHOUT running nodeadm or restarting
+// kubelet. It is meant to be invoked from a kubelet.service ExecStartPre drop-in (the
+// pre-kubelet boothook flow): nodeadm-config has already written the config files, kubelet
+// is starting and blocks on this, so the very first kubelet start uses the patched config.
+// This is the cross-account path — the providerID must be correct before kubelet ever
+// registers, since cross-account nodes don't get CCM's grace.
+func runPatch(ctx context.Context) int {
+	cfg, err := parseFlags()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	cluster, err := discovery.DescribeCluster(ctx, cfg.ClusterName, cfg.ClusterRegion)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to discover cluster: %v\n", err)
+		return 12
+	}
+	node, err := discovery.GetNodeMetadata(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to get node metadata: %v\n", err)
+		return 10
+	}
+
+	xacct, err := resolveCrossAccount(cfg, cluster, node)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 14
+	}
+
+	if err := patch.ApplyAll(ctx, cluster, node, xacct); err != nil {
+		fmt.Fprintf(os.Stderr, "error: patch failed: %v\n", err)
+		return 1
+	}
+	fmt.Printf("xrn-install: patched kubelet config for node %s (cluster %s/%s)\n", node.InstanceID, cfg.ClusterRegion, cfg.ClusterName)
 	return 0
 }
 
@@ -190,8 +250,10 @@ func runDiscover(ctx context.Context) int {
 }
 
 type config struct {
-	ClusterName   string
-	ClusterRegion string
+	ClusterName           string
+	ClusterRegion         string
+	ClusterAccountRoleARN string // cross-account: role in the cluster account the instance assumes
+	ClusterAccountExtID   string // optional sts:ExternalId for the AssumeRole
 }
 
 func parseFlags() (*config, error) {
@@ -212,6 +274,18 @@ func parseFlags() (*config, error) {
 			}
 			i++
 			cfg.ClusterRegion = args[i]
+		case "--cluster-account-role-arn":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("--cluster-account-role-arn requires a value")
+			}
+			i++
+			cfg.ClusterAccountRoleARN = args[i]
+		case "--cluster-account-external-id":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("--cluster-account-external-id requires a value")
+			}
+			i++
+			cfg.ClusterAccountExtID = args[i]
 		default:
 			return nil, fmt.Errorf("unknown flag: %s", args[i])
 		}
@@ -224,4 +298,36 @@ func parseFlags() (*config, error) {
 		return nil, fmt.Errorf("--cluster-region is required")
 	}
 	return cfg, nil
+}
+
+// resolveCrossAccount decides whether this install is cross-account by comparing the
+// instance's account (from IMDS) to the cluster's account (from the cluster ARN), and
+// validates the flag. Returns nil for the same-account case.
+//
+// Rules:
+//   - accounts match           → same-account, return nil (no flag needed)
+//   - accounts differ + flag   → cross-account, return the CrossAccount config
+//   - accounts differ + NO flag → error with a copy-pasteable hint
+//   - cluster account unknown   → fall back to flag presence (explicit opt-in)
+func resolveCrossAccount(cfg *config, cluster *discovery.ClusterInfo, node *discovery.NodeMetadata) (*patch.CrossAccount, error) {
+	clusterAcct := cluster.AccountID
+	instanceAcct := node.AccountID
+
+	mismatch := clusterAcct != "" && instanceAcct != "" && clusterAcct != instanceAcct
+
+	if cfg.ClusterAccountRoleARN == "" {
+		if mismatch {
+			return nil, fmt.Errorf(
+				"instance is in account %s but cluster is in account %s; set --cluster-account-role-arn arn:aws:iam::%s:role/XrnSatelliteNodeRole",
+				instanceAcct, clusterAcct, clusterAcct)
+		}
+		return nil, nil // same-account
+	}
+
+	// Flag is set. Use it (covers the mismatch case and the unknown-cluster-account case).
+	return &patch.CrossAccount{
+		Enabled:          true,
+		SatelliteRoleARN: cfg.ClusterAccountRoleARN,
+		ExternalID:       cfg.ClusterAccountExtID,
+	}, nil
 }

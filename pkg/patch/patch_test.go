@@ -176,6 +176,102 @@ users:
 	}
 }
 
+func TestRenderCredentialHelper(t *testing.T) {
+	s := RenderCredentialHelper("main", "us-east-2", "arn:aws:iam::820537372947:role/XrnSatelliteNodeRole", "")
+
+	for _, want := range []string{
+		"#!/bin/bash",
+		"aws sts assume-role --region us-east-2 --role-arn arn:aws:iam::820537372947:role/XrnSatelliteNodeRole",
+		`--role-session-name "$INSTANCE_ID"`, // identity must be system:node:<instance-id>
+		"exec aws eks get-token --cluster-name main --region us-east-2",
+		"169.254.169.254/latest/meta-data/instance-id",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("helper script missing %q\n---\n%s", want, s)
+		}
+	}
+	// No external-id arg when none given.
+	if strings.Contains(s, "--external-id") {
+		t.Error("helper should not include --external-id when empty")
+	}
+}
+
+func TestRenderCredentialHelper_ExternalID(t *testing.T) {
+	s := RenderCredentialHelper("main", "us-east-2", "arn:aws:iam::111:role/Sat", "my-ext-id")
+	if !strings.Contains(s, "--external-id my-ext-id") {
+		t.Errorf("helper should include external-id arg\n%s", s)
+	}
+}
+
+func TestInstallCredentialHelper(t *testing.T) {
+	tmpDir := t.TempDir()
+	kcFile := filepath.Join(tmpDir, "kubeconfig")
+	helperFile := filepath.Join(tmpDir, "xrn", "get-cluster-token.sh")
+
+	// A realistic nodeadm-generated kubeconfig with a get-token exec block.
+	os.WriteFile(kcFile, []byte(`apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://example.gr7.us-east-2.eks.amazonaws.com
+  name: main
+users:
+- name: kubelet
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1beta1
+      command: aws
+      args:
+      - eks
+      - get-token
+      - --cluster-name
+      - main
+      - --region
+      - us-west-1
+`), 0644)
+
+	origKc, origHelper := kubeconfigFile, credHelperPath
+	defer func() { setKubeconfigFile(origKc); setCredHelperPath(origHelper) }()
+	setKubeconfigFile(kcFile)
+	setCredHelperPath(helperFile)
+
+	cluster := &discovery.ClusterInfo{Name: "main", Region: "us-east-2"}
+	node := &discovery.NodeMetadata{InstanceID: "i-0abc", Region: "us-west-1"}
+	xacct := &CrossAccount{Enabled: true, SatelliteRoleARN: "arn:aws:iam::820537372947:role/XrnSatelliteNodeRole"}
+
+	if err := installCredentialHelper(cluster, node, xacct); err != nil {
+		t.Fatalf("installCredentialHelper: %v", err)
+	}
+
+	// Helper script exists and is executable.
+	info, err := os.Stat(helperFile)
+	if err != nil {
+		t.Fatalf("helper not written: %v", err)
+	}
+	if info.Mode().Perm()&0100 == 0 {
+		t.Errorf("helper not executable, mode = %v", info.Mode())
+	}
+
+	// kubeconfig exec now points at the helper.
+	data, _ := os.ReadFile(kcFile)
+	if !strings.Contains(string(data), helperFile) {
+		t.Errorf("kubeconfig exec not rewritten to helper path:\n%s", data)
+	}
+	// The old direct get-token args should be gone.
+	if strings.Contains(string(data), "get-token") {
+		t.Errorf("old get-token exec args should be replaced:\n%s", data)
+	}
+}
+
+func TestInstallCredentialHelper_RequiresRoleARN(t *testing.T) {
+	cluster := &discovery.ClusterInfo{Name: "main", Region: "us-east-2"}
+	node := &discovery.NodeMetadata{InstanceID: "i-0abc"}
+	err := installCredentialHelper(cluster, node, &CrossAccount{Enabled: true})
+	if err == nil {
+		t.Fatal("expected error when SatelliteRoleARN is empty")
+	}
+}
+
 func TestApplyAll(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -221,7 +317,7 @@ users:
 		AvailabilityZone: "eu-west-1b",
 	}
 
-	if err := ApplyAll(context.Background(), cluster, node); err != nil {
+	if err := ApplyAll(context.Background(), cluster, node, nil); err != nil {
 		t.Fatalf("ApplyAll failed: %v", err)
 	}
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -13,14 +14,16 @@ import (
 )
 
 type ClusterInfo struct {
-	Name            string `json:"name"`
-	Region          string `json:"region"`
-	Endpoint        string `json:"endpoint"`
-	CertificateAuth string `json:"certificateAuthority"`
-	ServiceCIDR     string `json:"serviceCidr"`
-	VPCID           string `json:"vpcId"`
+	Name            string   `json:"name"`
+	Region          string   `json:"region"`
+	Endpoint        string   `json:"endpoint"`
+	CertificateAuth string   `json:"certificateAuthority"`
+	ServiceCIDR     string   `json:"serviceCidr"`
+	VPCID           string   `json:"vpcId"`
 	VPCCIDRs        []string `json:"vpcCidrs"`
-	SecurityGroupID string `json:"clusterSecurityGroupId"`
+	SecurityGroupID string   `json:"clusterSecurityGroupId"`
+	ARN             string   `json:"arn"`
+	AccountID       string   `json:"accountId"` // parsed from the cluster ARN
 }
 
 type NodeMetadata struct {
@@ -56,13 +59,25 @@ func DescribeCluster(ctx context.Context, clusterName, clusterRegion string) (*C
 		CertificateAuth: aws.ToString(cluster.CertificateAuthority.Data),
 		SecurityGroupID: aws.ToString(cluster.ResourcesVpcConfig.ClusterSecurityGroupId),
 		VPCID:           aws.ToString(cluster.ResourcesVpcConfig.VpcId),
+		ARN:             aws.ToString(cluster.Arn),
 	}
+	info.AccountID = AccountIDFromARN(info.ARN)
 
 	if cluster.KubernetesNetworkConfig != nil && cluster.KubernetesNetworkConfig.ServiceIpv4Cidr != nil {
 		info.ServiceCIDR = aws.ToString(cluster.KubernetesNetworkConfig.ServiceIpv4Cidr)
 	}
 
 	return info, nil
+}
+
+// AccountIDFromARN extracts the account field (index 4) from an ARN, or "" if it can't be
+// parsed. arn:partition:service:region:account-id:resource.
+func AccountIDFromARN(arn string) string {
+	parts := strings.Split(arn, ":")
+	if len(parts) < 5 {
+		return ""
+	}
+	return parts[4]
 }
 
 func GetNodeMetadata(ctx context.Context) (*NodeMetadata, error) {
