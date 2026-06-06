@@ -64,28 +64,60 @@ xrnctl setup-iam \
 Creates `CrossRegionNodeRole` + matching instance profile (worker/CNI/ECR/SSM managed policies,
 EC2 trust) **and** the `HYBRID_LINUX` access entry for it — all in the cluster account.
 
-**Cross-account (two runs, two profiles):**
+**Cross-account (two runs, two profiles).** The cross-account auth chain is:
+`EC2 → XrnNodeRole (satellite acct) → XrnSatelliteNodeRole (cluster acct) → kubelet identity`.
+`setup-iam` creates **both** roles and wires the trust in both directions — nothing is left for
+you to hand-craft. Pick predictable names up front; the cluster role's ARN is referenced by both
+runs.
+
 ```bash
-# 1) in the SATELLITE account — create the node role + instance profile
+SAT_ACCT=310444902345
+CLUSTER_ACCT=820537372947
+NODE_ROLE_ARN=arn:aws:iam::$SAT_ACCT:role/XrnNodeRole
+SAT_ROLE_ARN=arn:aws:iam::$CLUSTER_ACCT:role/XrnSatelliteNodeRole
+
+# 1) SATELLITE account — node role + instance profile, plus an inline policy granting it
+#    sts:AssumeRole on the (not-yet-created) cluster-account role.
 xrnctl setup-iam --profile satellite \
   --cluster-name main --cluster-region us-east-2 \
-  --node-role-name XrnNodeRole --node-role-only
+  --node-role-name XrnNodeRole --node-role-only \
+  --satellite-role-arn "$SAT_ROLE_ARN"
 
-# 2) in the CLUSTER account — create the access entry for the cluster-account
-#    role that satellite kubelets assume (you create/trust this role out of band)
+# 2) CLUSTER account — create XrnSatelliteNodeRole with a trust policy allowing the
+#    satellite node role to assume it, grant it eks:DescribeCluster, and attach the
+#    HYBRID_LINUX access entry. One command does all three.
 xrnctl setup-iam --profile cluster \
   --cluster-name main --cluster-region us-east-2 \
-  --access-entry-only \
-  --node-role-arn arn:aws:iam::<cluster-acct>:role/XrnSatelliteNodeRole
+  --create-satellite-role \
+  --trusted-node-role-arn "$NODE_ROLE_ARN" \
+  [--satellite-role-name XrnSatelliteNodeRole] \
+  [--external-id <id>]
 ```
 
-Flags: `--node-role-name` (role to create/reuse), `--node-role-arn` (for `--access-entry-only`,
-the principal the access entry is for), `--node-role-only` / `--access-entry-only` (do just one
-half; mutually exclusive).
+After step 2, `xrn-install` on the satellite node can: assume `XrnNodeRole` (EC2), assume
+`XrnSatelliteNodeRole` (granted in step 1, trusted in step 2), call `eks:DescribeCluster`
+(granted in step 2), and register via the `HYBRID_LINUX` access entry (created in step 2).
 
 > The access entry's principal is always a **cluster-account** role. EKS rejects cross-account
 > principals on `HYBRID_LINUX` entries, so a cross-account satellite's kubelet assumes a
 > cluster-account role (`XrnSatelliteNodeRole`) and that role holds the access entry.
+
+**Flags:**
+- `--node-role-name` — node role to create/reuse (satellite account).
+- `--node-role-only` / `--access-entry-only` — do just one half of the *same-account* split (mutually exclusive).
+- `--node-role-arn` — for `--access-entry-only`, the principal the access entry is for.
+- `--satellite-role-arn` — step 1: grant the node role `sts:AssumeRole` on this (cluster-account) ARN.
+- `--create-satellite-role` — step 2: create the cluster-account role (its own mode).
+- `--trusted-node-role-arn` — step 2 (required): the satellite-account node role allowed to assume it.
+- `--satellite-role-name` — step 2: role name to create (default `XrnSatelliteNodeRole`).
+- `--external-id` — step 2: optional `sts:ExternalId` required by the trust policy (confused-deputy protection).
+
+> If you set `--external-id` in step 2, also pass the same value to `xrn-install` via
+> `--cluster-account-external-id` (and to the boothook's `patch` invocation) so the AssumeRole matches.
+
+**External-id (optional, recommended for cross-org):** when the satellite and cluster accounts are
+owned by different teams, set `--external-id` so the cluster role can only be assumed with the
+agreed secret. Thread the same value through `xrn-install --cluster-account-external-id`.
 
 ### `add-satellite` — register a satellite VPC
 
@@ -197,13 +229,16 @@ Template: `deploy/asg/userdata-cross-account.template.txt` (see `deploy/asg/READ
 ## End-to-end: onboard a cross-account satellite
 
 1. **Network + SG + auth** prerequisites in place (above).
-2. **IAM:**
+2. **IAM** (both roles + trust both ways, two runs):
    ```bash
+   # satellite account: node role + instance profile + AssumeRole grant on the cluster role
    xrnctl setup-iam --profile satellite --cluster-name main --cluster-region us-east-2 \
-     --node-role-name XrnNodeRole --node-role-only
-   # create XrnSatelliteNodeRole in the cluster account (trusts the satellite node role), then:
+     --node-role-name XrnNodeRole --node-role-only \
+     --satellite-role-arn arn:aws:iam::<cluster-acct>:role/XrnSatelliteNodeRole
+   # cluster account: create XrnSatelliteNodeRole (trust + eks:DescribeCluster) + access entry
    xrnctl setup-iam --profile cluster --cluster-name main --cluster-region us-east-2 \
-     --access-entry-only --node-role-arn arn:aws:iam::<cluster-acct>:role/XrnSatelliteNodeRole
+     --create-satellite-role \
+     --trusted-node-role-arn arn:aws:iam::<satellite-acct>:role/XrnNodeRole
    ```
 3. **Register the satellite + apply the CNI DaemonSet:**
    ```bash

@@ -42,6 +42,8 @@ type iamAPI interface {
 	GetRole(ctx context.Context, in *iam.GetRoleInput, opts ...func(*iam.Options)) (*iam.GetRoleOutput, error)
 	CreateRole(ctx context.Context, in *iam.CreateRoleInput, opts ...func(*iam.Options)) (*iam.CreateRoleOutput, error)
 	AttachRolePolicy(ctx context.Context, in *iam.AttachRolePolicyInput, opts ...func(*iam.Options)) (*iam.AttachRolePolicyOutput, error)
+	PutRolePolicy(ctx context.Context, in *iam.PutRolePolicyInput, opts ...func(*iam.Options)) (*iam.PutRolePolicyOutput, error)
+	UpdateAssumeRolePolicy(ctx context.Context, in *iam.UpdateAssumeRolePolicyInput, opts ...func(*iam.Options)) (*iam.UpdateAssumeRolePolicyOutput, error)
 	GetInstanceProfile(ctx context.Context, in *iam.GetInstanceProfileInput, opts ...func(*iam.Options)) (*iam.GetInstanceProfileOutput, error)
 	CreateInstanceProfile(ctx context.Context, in *iam.CreateInstanceProfileInput, opts ...func(*iam.Options)) (*iam.CreateInstanceProfileOutput, error)
 	AddRoleToInstanceProfile(ctx context.Context, in *iam.AddRoleToInstanceProfileInput, opts ...func(*iam.Options)) (*iam.AddRoleToInstanceProfileOutput, error)
@@ -65,6 +67,10 @@ const ec2AssumeRolePolicy = `{
   ]
 }`
 
+// assumeSatelliteRolePolicyName is the inline policy on the satellite node role that grants
+// it permission to assume the cluster-account satellite role.
+const assumeSatelliteRolePolicyName = "XrnAssumeClusterAccountRole"
+
 // Options configures a setup-iam run.
 type Options struct {
 	ClusterName   string
@@ -76,6 +82,21 @@ type Options struct {
 
 	NodeRoleOnly    bool // create only the role + instance profile (satellite account)
 	AccessEntryOnly bool // create only the access entry (cluster account)
+
+	// Cross-account: the cluster-account role the satellite node assumes for kubelet auth and
+	// cluster discovery. Predictable ARN, set on BOTH runs of the two-step flow.
+	//
+	// Step 1 (satellite profile, --node-role-only): if SatelliteRoleARN is set, an inline
+	// sts:AssumeRole policy targeting it is attached to the node role.
+	//
+	// Step 2 (cluster profile, --create-satellite-role): creates SatelliteRoleName with a trust
+	// policy allowing NodeRoleARN to assume it, grants it eks:DescribeCluster, and attaches the
+	// HYBRID_LINUX access entry to it.
+	SatelliteRoleARN    string // step 1: the cluster-account role ARN the node role may assume
+	CreateSatelliteRole bool   // step 2: create the cluster-account satellite role
+	SatelliteRoleName   string // step 2: name of the cluster-account role to create (default XrnSatelliteNodeRole)
+	TrustedNodeRoleARN  string // step 2: the satellite-account node role ARN allowed to assume it
+	ExternalID          string // step 2: optional sts:ExternalId required by the trust policy
 }
 
 // Result reports what was done.
@@ -88,6 +109,11 @@ type Result struct {
 	RoleCreated         bool
 	InstanceProfileMade bool
 	AccessEntryCreated  bool
+
+	SatelliteRoleName    string
+	SatelliteRoleARN     string
+	SatelliteRoleCreated bool
+	AssumeGrantAdded     bool // step 1: inline AssumeRole policy attached to the node role
 }
 
 // Run executes the requested IAM setup. By default it does both halves (role + instance
@@ -100,6 +126,28 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	}
 
 	res := &Result{}
+	iamClient := iam.NewFromConfig(cfg)
+
+	// Step 2 (cluster account): create the cluster-account satellite role the node assumes,
+	// with cross-account trust + eks:DescribeCluster, then fall through to attach its access entry.
+	if opts.CreateSatelliteRole {
+		if opts.TrustedNodeRoleARN == "" {
+			return nil, fmt.Errorf("--create-satellite-role requires --trusted-node-role-arn (the satellite-account node role allowed to assume it)")
+		}
+		name := opts.SatelliteRoleName
+		if name == "" {
+			name = "XrnSatelliteNodeRole"
+		}
+		if err := ensureSatelliteRole(ctx, iamClient, name, opts.TrustedNodeRoleARN, opts.ExternalID, res); err != nil {
+			return nil, err
+		}
+		// Attach the HYBRID_LINUX access entry to the role we just created.
+		eksClient := eks.NewFromConfig(cfg)
+		if err := ensureAccessEntry(ctx, eksClient, opts.ClusterName, res.SatelliteRoleARN, res); err != nil {
+			return nil, err
+		}
+		return res, nil
+	}
 
 	doRole := !opts.AccessEntryOnly
 	doAccessEntry := !opts.NodeRoleOnly
@@ -108,12 +156,17 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		if opts.NodeRoleName == "" {
 			return nil, fmt.Errorf("--node-role-name is required to create the node role")
 		}
-		iamClient := iam.NewFromConfig(cfg)
 		if err := ensureNodeRole(ctx, iamClient, opts.NodeRoleName, res); err != nil {
 			return nil, err
 		}
 		if err := ensureInstanceProfile(ctx, iamClient, opts.NodeRoleName, res); err != nil {
 			return nil, err
+		}
+		// Cross-account step 1: grant the node role permission to assume the cluster-account role.
+		if opts.SatelliteRoleARN != "" {
+			if err := ensureAssumeRoleGrant(ctx, iamClient, opts.NodeRoleName, opts.SatelliteRoleARN, res); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -169,6 +222,114 @@ func ensureNodeRole(ctx context.Context, c iamAPI, name string, res *Result) err
 		}
 	}
 	return nil
+}
+
+// ensureAssumeRoleGrant attaches an inline policy to the satellite node role granting it
+// sts:AssumeRole on the cluster-account satellite role. The target ARN need not exist yet
+// (IAM permission-policy resources are not validated for existence at put time).
+func ensureAssumeRoleGrant(ctx context.Context, c iamAPI, nodeRoleName, satelliteRoleARN string, res *Result) error {
+	doc := fmt.Sprintf(`{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": %q
+    }
+  ]
+}`, satelliteRoleARN)
+	_, err := c.PutRolePolicy(ctx, &iam.PutRolePolicyInput{
+		RoleName:       aws.String(nodeRoleName),
+		PolicyName:     aws.String(assumeSatelliteRolePolicyName),
+		PolicyDocument: aws.String(doc),
+	})
+	if err != nil {
+		return fmt.Errorf("iam:PutRolePolicy %s/%s: %w", nodeRoleName, assumeSatelliteRolePolicyName, err)
+	}
+	res.AssumeGrantAdded = true
+	return nil
+}
+
+// ensureSatelliteRole creates (or reuses) the cluster-account role that satellite nodes assume
+// for kubelet auth and cluster discovery. Trust policy allows trustedNodeRoleARN to assume it
+// (optionally gated by externalID); permission policy grants eks:DescribeCluster.
+func ensureSatelliteRole(ctx context.Context, c iamAPI, name, trustedNodeRoleARN, externalID string, res *Result) error {
+	trust := buildCrossAccountTrustPolicy(trustedNodeRoleARN, externalID)
+
+	out, err := c.GetRole(ctx, &iam.GetRoleInput{RoleName: aws.String(name)})
+	if err == nil {
+		res.SatelliteRoleName = name
+		res.SatelliteRoleARN = aws.ToString(out.Role.Arn)
+		// Role exists — refresh its trust policy so re-runs converge on the intended trust.
+		if _, uerr := c.UpdateAssumeRolePolicy(ctx, &iam.UpdateAssumeRolePolicyInput{
+			RoleName:       aws.String(name),
+			PolicyDocument: aws.String(trust),
+		}); uerr != nil {
+			return fmt.Errorf("iam:UpdateAssumeRolePolicy %s: %w", name, uerr)
+		}
+	} else if isNotFound(err) {
+		created, cerr := c.CreateRole(ctx, &iam.CreateRoleInput{
+			RoleName:                 aws.String(name),
+			AssumeRolePolicyDocument: aws.String(trust),
+			Description:              aws.String("EKS cross-account satellite kubelet role (managed by xrnctl)"),
+		})
+		if cerr != nil {
+			return fmt.Errorf("iam:CreateRole %s: %w", name, cerr)
+		}
+		res.SatelliteRoleName = name
+		res.SatelliteRoleARN = aws.ToString(created.Role.Arn)
+		res.SatelliteRoleCreated = true
+	} else {
+		return fmt.Errorf("iam:GetRole %s: %w", name, err)
+	}
+
+	// Grant eks:DescribeCluster (xrn-install assumes this role to discover the cluster).
+	descDoc := `{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "eks:DescribeCluster",
+      "Resource": "*"
+    }
+  ]
+}`
+	if _, perr := c.PutRolePolicy(ctx, &iam.PutRolePolicyInput{
+		RoleName:       aws.String(name),
+		PolicyName:     aws.String("XrnDescribeCluster"),
+		PolicyDocument: aws.String(descDoc),
+	}); perr != nil {
+		return fmt.Errorf("iam:PutRolePolicy %s/XrnDescribeCluster: %w", name, perr)
+	}
+	return nil
+}
+
+// buildCrossAccountTrustPolicy returns a trust policy allowing trustedRoleARN to assume the
+// role, optionally requiring sts:ExternalId.
+func buildCrossAccountTrustPolicy(trustedRoleARN, externalID string) string {
+	if externalID != "" {
+		return fmt.Sprintf(`{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"AWS": %q},
+      "Action": "sts:AssumeRole",
+      "Condition": {"StringEquals": {"sts:ExternalId": %q}}
+    }
+  ]
+}`, trustedRoleARN, externalID)
+	}
+	return fmt.Sprintf(`{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"AWS": %q},
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}`, trustedRoleARN)
 }
 
 func ensureInstanceProfile(ctx context.Context, c iamAPI, roleName string, res *Result) error {

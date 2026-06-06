@@ -2,6 +2,7 @@ package iamsetup
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -23,6 +24,8 @@ type fakeIAM struct {
 	createdProfile     bool
 	attachedPolicies   []string
 	addedRoleToProfile bool
+	inlinePolicies     map[string]string // policyName -> document
+	trustUpdated       bool
 }
 
 func (f *fakeIAM) GetRole(ctx context.Context, in *iam.GetRoleInput, _ ...func(*iam.Options)) (*iam.GetRoleOutput, error) {
@@ -44,6 +47,19 @@ func (f *fakeIAM) CreateRole(ctx context.Context, in *iam.CreateRoleInput, _ ...
 func (f *fakeIAM) AttachRolePolicy(ctx context.Context, in *iam.AttachRolePolicyInput, _ ...func(*iam.Options)) (*iam.AttachRolePolicyOutput, error) {
 	f.attachedPolicies = append(f.attachedPolicies, aws.ToString(in.PolicyArn))
 	return &iam.AttachRolePolicyOutput{}, nil
+}
+
+func (f *fakeIAM) PutRolePolicy(ctx context.Context, in *iam.PutRolePolicyInput, _ ...func(*iam.Options)) (*iam.PutRolePolicyOutput, error) {
+	if f.inlinePolicies == nil {
+		f.inlinePolicies = map[string]string{}
+	}
+	f.inlinePolicies[aws.ToString(in.PolicyName)] = aws.ToString(in.PolicyDocument)
+	return &iam.PutRolePolicyOutput{}, nil
+}
+
+func (f *fakeIAM) UpdateAssumeRolePolicy(ctx context.Context, in *iam.UpdateAssumeRolePolicyInput, _ ...func(*iam.Options)) (*iam.UpdateAssumeRolePolicyOutput, error) {
+	f.trustUpdated = true
+	return &iam.UpdateAssumeRolePolicyOutput{}, nil
 }
 
 func (f *fakeIAM) GetInstanceProfile(ctx context.Context, in *iam.GetInstanceProfileInput, _ ...func(*iam.Options)) (*iam.GetInstanceProfileOutput, error) {
@@ -213,6 +229,73 @@ func TestEnsureAccessEntry_ExistingWrongType(t *testing.T) {
 	err := ensureAccessEntry(context.Background(), f, "main", "arn:aws:iam::111122223333:role/CrossRegionNodeRole", res)
 	if err == nil {
 		t.Fatal("expected error when existing access entry has the wrong type")
+	}
+}
+
+func TestEnsureAssumeRoleGrant(t *testing.T) {
+	f := &fakeIAM{}
+	res := &Result{}
+	arn := "arn:aws:iam::820537372947:role/XrnSatelliteNodeRole"
+	if err := ensureAssumeRoleGrant(context.Background(), f, "XrnNodeRole", arn, res); err != nil {
+		t.Fatalf("ensureAssumeRoleGrant: %v", err)
+	}
+	if !res.AssumeGrantAdded {
+		t.Error("AssumeGrantAdded should be true")
+	}
+	doc, ok := f.inlinePolicies[assumeSatelliteRolePolicyName]
+	if !ok {
+		t.Fatalf("inline policy %s not put", assumeSatelliteRolePolicyName)
+	}
+	if !strings.Contains(doc, arn) || !strings.Contains(doc, "sts:AssumeRole") {
+		t.Errorf("policy doc missing AssumeRole on target ARN:\n%s", doc)
+	}
+}
+
+func TestEnsureSatelliteRole_CreatesWithTrustAndDescribe(t *testing.T) {
+	f := &fakeIAM{roleExists: false}
+	res := &Result{}
+	nodeARN := "arn:aws:iam::310444902345:role/XrnNodeRole"
+	if err := ensureSatelliteRole(context.Background(), f, "XrnSatelliteNodeRole", nodeARN, "", res); err != nil {
+		t.Fatalf("ensureSatelliteRole: %v", err)
+	}
+	if !res.SatelliteRoleCreated {
+		t.Error("SatelliteRoleCreated should be true")
+	}
+	if res.SatelliteRoleARN == "" {
+		t.Error("SatelliteRoleARN should be set")
+	}
+	// eks:DescribeCluster inline policy present.
+	desc, ok := f.inlinePolicies["XrnDescribeCluster"]
+	if !ok || !strings.Contains(desc, "eks:DescribeCluster") {
+		t.Errorf("XrnDescribeCluster policy missing or wrong:\n%s", desc)
+	}
+}
+
+func TestEnsureSatelliteRole_ReusesAndRefreshesTrust(t *testing.T) {
+	f := &fakeIAM{roleExists: true, roleARN: "arn:aws:iam::820537372947:role/XrnSatelliteNodeRole"}
+	res := &Result{}
+	if err := ensureSatelliteRole(context.Background(), f, "XrnSatelliteNodeRole", "arn:aws:iam::310444902345:role/XrnNodeRole", "", res); err != nil {
+		t.Fatalf("ensureSatelliteRole: %v", err)
+	}
+	if res.SatelliteRoleCreated {
+		t.Error("should not report created for an existing role")
+	}
+	if !f.trustUpdated {
+		t.Error("trust policy should be refreshed on an existing role")
+	}
+}
+
+func TestBuildCrossAccountTrustPolicy(t *testing.T) {
+	nodeARN := "arn:aws:iam::310444902345:role/XrnNodeRole"
+
+	noExt := buildCrossAccountTrustPolicy(nodeARN, "")
+	if !strings.Contains(noExt, nodeARN) || strings.Contains(noExt, "ExternalId") {
+		t.Errorf("no-external-id policy wrong:\n%s", noExt)
+	}
+
+	withExt := buildCrossAccountTrustPolicy(nodeARN, "ext-123")
+	if !strings.Contains(withExt, "ext-123") || !strings.Contains(withExt, "sts:ExternalId") {
+		t.Errorf("external-id policy should include the condition:\n%s", withExt)
 	}
 }
 

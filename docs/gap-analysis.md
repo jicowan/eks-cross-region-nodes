@@ -213,6 +213,27 @@ The ExecStartPre-as-gate design proved itself twice: on the v0.1.4 run (discover
 kubelet in a retry loop so the node never mis-registered; on v0.1.5 it released kubelet only after
 a successful patch. Cross-account satellite nodes are now fully supported by the tooling.
 
+## 5g. `setup-iam` now provisions the full cross-account IAM chain (2026-06-06)
+
+Closed the "create/trust `XrnSatelliteNodeRole` out of band" gap. Previously `setup-iam` created
+the satellite node role + instance profile and attached an access entry to a *pre-existing*
+cluster-account role; the cluster-account role itself, its cross-account trust policy, the node
+role's `sts:AssumeRole` grant, and the role's `eks:DescribeCluster` permission were all manual.
+
+`setup-iam` now creates the whole chain across two profile-scoped runs:
+- **Step 1** (`--node-role-only --satellite-role-arn <cluster-role-arn>`, satellite profile):
+  node role + instance profile **plus** an inline `sts:AssumeRole` policy targeting the
+  cluster-account role (whose ARN is predictable, so it need not exist yet).
+- **Step 2** (`--create-satellite-role --trusted-node-role-arn <node-role-arn>`, cluster profile):
+  creates `XrnSatelliteNodeRole` with a trust policy allowing the node role to assume it
+  (optionally `--external-id`), grants it `eks:DescribeCluster` (needed by `xrn-install patch`
+  discovery), and attaches the `HYBRID_LINUX` access entry. Idempotent — re-runs refresh the
+  trust policy.
+
+New IAM API surface: `PutRolePolicy`, `UpdateAssumeRolePolicy`. New tests cover the AssumeRole
+grant, satellite-role create + trust refresh, and the trust-policy builder (with/without external
+id). The user guide and in-binary help were updated to match.
+
 ## 6. Non-gaps (things the PRDs call for that ARE done)
 
 - ConfigMap as canonical registry (not SSM) — done, matches PRD §5 decision.

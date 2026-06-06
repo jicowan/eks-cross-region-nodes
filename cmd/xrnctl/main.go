@@ -49,7 +49,9 @@ Usage:
   xrnctl add-satellite     --cluster-name NAME --cluster-region REGION --vpc-id VPC --satellite-region REGION [--account-id ACCT] [--vpc-cidr c1,c2] [--dry-run] [--with-eniconfigs] [--subnet-ids s1,s2] [--security-group-ids sg1,sg2]
   xrnctl remove-satellite  --cluster-name NAME --cluster-region REGION --vpc-id VPC
   xrnctl list-satellites   --cluster-name NAME --cluster-region REGION
-  xrnctl setup-iam         --cluster-name NAME --cluster-region REGION [--node-role-name NAME] [--node-role-arn ARN] [--node-role-only|--access-entry-only] [--profile PROFILE]
+  xrnctl setup-iam         --cluster-name NAME --cluster-region REGION [--node-role-name NAME] [--node-role-arn ARN]
+                           [--node-role-only|--access-entry-only] [--satellite-role-arn ARN]
+                           [--create-satellite-role --trusted-node-role-arn ARN [--satellite-role-name NAME] [--external-id ID]] [--profile PROFILE]
   xrnctl verify            --cluster-name NAME --cluster-region REGION
   xrnctl version
 
@@ -78,9 +80,11 @@ Notes:
 
   setup-iam (same-account): run once (default profile) — creates the node role + instance
   profile AND the HYBRID_LINUX access entry in one go.
-  setup-iam (cross-account): run twice —
-    1) --profile <satellite> --node-role-name CrossRegionNodeRole --node-role-only
-    2) --profile <cluster>   --node-role-arn <arn-from-step-1> --access-entry-only
+  setup-iam (cross-account): run twice — creates BOTH roles and wires the trust both ways:
+    1) --profile <satellite> --node-role-name XrnNodeRole --node-role-only \
+         --satellite-role-arn arn:aws:iam::<cluster-acct>:role/XrnSatelliteNodeRole
+    2) --profile <cluster>   --create-satellite-role \
+         --trusted-node-role-arn arn:aws:iam::<satellite-acct>:role/XrnNodeRole
 
   ENIConfigs (custom networking) are only needed when pods must use a different subnet
   or security group than the node. By default, add-satellite does NOT create ENIConfigs —
@@ -247,10 +251,15 @@ func runListSatellites(ctx context.Context) int {
 
 type setupIAMConfig struct {
 	globalConfig
-	NodeRoleName    string
-	NodeRoleARN     string
-	NodeRoleOnly    bool
-	AccessEntryOnly bool
+	NodeRoleName        string
+	NodeRoleARN         string
+	NodeRoleOnly        bool
+	AccessEntryOnly     bool
+	SatelliteRoleARN    string
+	CreateSatelliteRole bool
+	SatelliteRoleName   string
+	TrustedNodeRoleARN  string
+	ExternalID          string
 }
 
 func runSetupIAM(ctx context.Context) int {
@@ -261,13 +270,18 @@ func runSetupIAM(ctx context.Context) int {
 	}
 
 	res, err := iamsetup.Run(ctx, iamsetup.Options{
-		ClusterName:     cfg.ClusterName,
-		ClusterRegion:   cfg.ClusterRegion,
-		Profile:         cfg.Profile,
-		NodeRoleName:    cfg.NodeRoleName,
-		NodeRoleARN:     cfg.NodeRoleARN,
-		NodeRoleOnly:    cfg.NodeRoleOnly,
-		AccessEntryOnly: cfg.AccessEntryOnly,
+		ClusterName:         cfg.ClusterName,
+		ClusterRegion:       cfg.ClusterRegion,
+		Profile:             cfg.Profile,
+		NodeRoleName:        cfg.NodeRoleName,
+		NodeRoleARN:         cfg.NodeRoleARN,
+		NodeRoleOnly:        cfg.NodeRoleOnly,
+		AccessEntryOnly:     cfg.AccessEntryOnly,
+		SatelliteRoleARN:    cfg.SatelliteRoleARN,
+		CreateSatelliteRole: cfg.CreateSatelliteRole,
+		SatelliteRoleName:   cfg.SatelliteRoleName,
+		TrustedNodeRoleARN:  cfg.TrustedNodeRoleARN,
+		ExternalID:          cfg.ExternalID,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -287,6 +301,16 @@ func runSetupIAM(ctx context.Context) int {
 			verb = "created"
 		}
 		fmt.Printf("✓ Instance profile %s (%s)\n", res.InstanceProfileName, verb)
+	}
+	if res.AssumeGrantAdded {
+		fmt.Printf("✓ Node role granted sts:AssumeRole on %s\n", cfg.SatelliteRoleARN)
+	}
+	if res.SatelliteRoleName != "" {
+		verb := "exists (trust refreshed)"
+		if res.SatelliteRoleCreated {
+			verb = "created"
+		}
+		fmt.Printf("✓ Cluster-account satellite role %s (%s), with eks:DescribeCluster\n", res.SatelliteRoleARN, verb)
 	}
 	if res.AccessEntryARN != "" {
 		verb := "exists"
@@ -450,6 +474,20 @@ func parseSetupIAMFlags() (*setupIAMConfig, error) {
 			cfg.NodeRoleOnly = true
 		case "--access-entry-only":
 			cfg.AccessEntryOnly = true
+		case "--satellite-role-arn":
+			i++
+			cfg.SatelliteRoleARN = argValue(args, i)
+		case "--create-satellite-role":
+			cfg.CreateSatelliteRole = true
+		case "--satellite-role-name":
+			i++
+			cfg.SatelliteRoleName = argValue(args, i)
+		case "--trusted-node-role-arn":
+			i++
+			cfg.TrustedNodeRoleARN = argValue(args, i)
+		case "--external-id":
+			i++
+			cfg.ExternalID = argValue(args, i)
 		default:
 			return nil, fmt.Errorf("unknown flag: %s", args[i])
 		}
@@ -457,6 +495,19 @@ func parseSetupIAMFlags() (*setupIAMConfig, error) {
 	if cfg.ClusterName == "" || cfg.ClusterRegion == "" {
 		return nil, fmt.Errorf("--cluster-name and --cluster-region are required")
 	}
+
+	// Step-2 mode: create the cluster-account satellite role. Distinct validation; ignores the
+	// node-role flags.
+	if cfg.CreateSatelliteRole {
+		if cfg.NodeRoleOnly || cfg.AccessEntryOnly {
+			return nil, fmt.Errorf("--create-satellite-role is its own mode; don't combine it with --node-role-only/--access-entry-only")
+		}
+		if cfg.TrustedNodeRoleARN == "" {
+			return nil, fmt.Errorf("--create-satellite-role requires --trusted-node-role-arn (the satellite-account node role allowed to assume it)")
+		}
+		return cfg, nil
+	}
+
 	if cfg.NodeRoleOnly && cfg.AccessEntryOnly {
 		return nil, fmt.Errorf("--node-role-only and --access-entry-only are mutually exclusive")
 	}
