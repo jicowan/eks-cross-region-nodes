@@ -2,7 +2,15 @@
 
 Tools for joining EC2 worker nodes in satellite VPCs/regions to an EKS cluster in a different region.
 
-> **Cross-account support is in progress.** [docs/PRD-cross-account-nodes.md](./docs/PRD-cross-account-nodes.md) v2 (2026-06-05) documents the validated architecture for joining satellites in *other AWS accounts*, including a planned label change (`compute-type=cross-region` → `compute-type=hybrid`) for consistency across topologies. Migration is tracked in PRD §7 Phase 5e.
+> **Cross-account support is implemented and validated** (release v0.1.5). Satellites can live in
+> *other AWS accounts*, not just other regions. Cross-account nodes run a dedicated
+> `aws-node-satellite-<acct>-<region>` DaemonSet (no Pod Identity → VPC CNI uses the
+> satellite-account instance role via IMDS) and use `compute-type=hybrid`; same-account/cross-region
+> nodes ride the stock `aws-node` with `compute-type=cross-region`.
+>
+> **Start here:** [docs/user-guide.md](./docs/user-guide.md) — operator how-to for `xrn-install` and
+> `xrnctl` (both topologies). Design + rationale: [docs/PRD-cross-account-nodes.md](./docs/PRD-cross-account-nodes.md).
+> Implementation/validation record: [docs/gap-analysis.md](./docs/gap-analysis.md).
 
 ## Components
 

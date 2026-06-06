@@ -192,6 +192,27 @@ Live-tested the cross-account toolchain against the lab (release v0.1.4 has the 
 4. **`verify` false positives + blind spot.** It (a) flagged missing ENIConfigs as drift even though ENIConfigs are optional, and (b) only selected `compute-type=cross-region` nodes, so cross-account (`hybrid`) nodes were invisible. Fix: select `compute-type in (cross-region,hybrid)`, and only check for the zone label (not ENIConfig presence) on satellite nodes.
 5. **`xrn-install` discovery failed cross-account (blocker, found in fresh-node boot).** `eks:DescribeCluster` ran with the satellite-account instance role → `ResourceNotFoundException: No cluster found for name: main` (the cluster is in the other account). The `--cluster-account-role-arn` was only consumed later for the kubelet credential helper, not for discovery. Fix: `discovery.DescribeClusterWithRole` assumes the cluster-account role (via STS) before DescribeCluster when the flag is set; `runInit`/`runPatch` pass it through. **Requires a new release** (on-node binary). The ExecStartPre gate correctly held kubelet in a retry loop the whole time — the node never mis-registered, confirming the gate design.
 
+## 5f. Cross-account full end-to-end VALIDATED (2026-06-06, release v0.1.5)
+
+A fresh us-west-1 node (`i-082606347597b0084`, account 310444902345) was launched through the
+entire new toolchain and reached Ready — the complete cross-account path, automated, no manual steps:
+
+1. ASG launched with the cross-account userdata (LT v7, `xrn-install` v0.1.5).
+2. cloud-boothook downloaded `xrn-install` and wrote the kubelet `ExecStartPre` drop-in.
+3. nodeadm-config wrote the kubelet config; kubelet's `ExecStartPre` ran `xrn-install patch`, which:
+   - assumed the cluster-account role for `eks:DescribeCluster` (the v0.1.5 discovery fix),
+   - set `providerID = eks-hybrid:///us-east-2/main/i-082606347597b0084`, hostname-override, topology labels,
+   - installed the AssumeRole credential helper and pointed the kubeconfig exec at it.
+4. kubelet started (first registration already correct) → joined with the hybrid providerID.
+5. Node labeled `compute-type=hybrid` + `satellite-account=310444902345` → the generated
+   `aws-node-satellite-310444902345-us-west-1` DS scheduled on it; pod got a satellite-VPC IP
+   (10.2.142.209), IPAMD healthy via IMDS (no InvalidToken), 2/2 Running.
+6. Node stayed Ready past the reap window; **no DeletingNode event**. `verify` clean.
+
+The ExecStartPre-as-gate design proved itself twice: on the v0.1.4 run (discovery bug) it held
+kubelet in a retry loop so the node never mis-registered; on v0.1.5 it released kubelet only after
+a successful patch. Cross-account satellite nodes are now fully supported by the tooling.
+
 ## 6. Non-gaps (things the PRDs call for that ARE done)
 
 - ConfigMap as canonical registry (not SSM) — done, matches PRD §5 decision.
