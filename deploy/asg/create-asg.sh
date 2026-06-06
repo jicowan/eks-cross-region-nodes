@@ -1,12 +1,17 @@
 #!/bin/bash
 # create-asg.sh — Create a launch template and ASG in a satellite region for cross-region EKS nodes.
 #
+# This is the SAME-ACCOUNT / cross-region path (satellite VPC in the cluster's own account, another
+# region). For a CROSS-ACCOUNT satellite, use the cross-account user-data template instead — see
+# README-cross-account.md.
+#
 # Prerequisites (must already exist):
-#   - Cluster's RemoteNetworkConfig includes the satellite VPC CIDR
-#   - HYBRID_LINUX access entry on the cluster for the node IAM role
-#   - Cluster SG allows TCP 443 from the satellite VPC CIDR
+#   - Node IAM role + instance profile + HYBRID_LINUX access entry — create with:
+#       xrnctl setup-iam --cluster-name <name> --cluster-region <region> --node-role-name CrossRegionNodeRole
+#   - Satellite registered (ConfigMap SNAT CIDRs + RemoteNetworkConfig) — create with:
+#       xrnctl add-satellite --cluster-name <name> --cluster-region <region> --vpc-id <vpc> --satellite-region <region>
+#   - Cluster SG allows TCP 443 (+ 53/pods/10250) from the satellite VPC CIDR
 #   - TGW peering / routes between cluster and satellite VPCs
-#   - SNAT exclusion CIDRs set on the aws-node DaemonSet (xrnctl add-region)
 #   - xrn-install released to https://github.com/jicowan/eks-cross-region-nodes/releases
 #
 # Usage:
@@ -14,13 +19,13 @@
 
 set -euo pipefail
 
-# ---- Configuration (edit these) ----
+# ---- Configuration (edit these — placeholders below are EXAMPLES, replace with your values) ----
 CLUSTER_NAME="main"
 CLUSTER_REGION="us-east-2"
 SATELLITE_REGION="eu-west-1"
-SATELLITE_VPC_ID="vpc-09c3d15c27ab543c5"
-SATELLITE_SUBNET_IDS="subnet-02831de2565a4f110,subnet-0d753e27930f22656"  # comma-separated
-SATELLITE_NODE_SG="sg-04a0cbd3f55689742"
+SATELLITE_VPC_ID="vpc-xxxxxxxxxxxxxxxxx"
+SATELLITE_SUBNET_IDS="subnet-xxxxxxxxxxxxxxxxx,subnet-yyyyyyyyyyyyyyyyy"  # comma-separated
+SATELLITE_NODE_SG="sg-xxxxxxxxxxxxxxxxx"
 INSTANCE_PROFILE_NAME="CrossRegionNodeProfile"
 INSTANCE_TYPE="m6i.xlarge"
 

@@ -2,23 +2,30 @@
 
 Scripts to create an EC2 Auto Scaling Group in a satellite region for cross-region EKS nodes. Each instance launched by the ASG bootstraps via `nodeadm` then runs `xrn-install` to apply the cross-region kubelet patches.
 
+> **Same-account vs cross-account.** This README and `create-asg.sh` cover the **same-account /
+> cross-region** path (satellite VPC in the cluster's own account). For a satellite in a **different
+> AWS account**, the bootstrap ordering and user-data differ — see
+> [README-cross-account.md](./README-cross-account.md) and `userdata-cross-account.template.txt`.
+
 ## Files
 
 | File | Purpose |
 |---|---|
-| `userdata.template.txt` | MIME multipart user-data template — Part 1 is the NodeConfig for nodeadm; Part 2 downloads `xrn-install` from your GitHub release and runs it |
-| `create-asg.sh` | Creates a launch template and ASG in the satellite region |
+| `userdata.template.txt` | Same-account MIME multipart user-data — Part 1 is the NodeConfig for nodeadm; Part 2 downloads `xrn-install` and runs `init` (post-boot) |
+| `userdata-cross-account.template.txt` | Cross-account user-data — cloud-boothook + kubelet `ExecStartPre` running `xrn-install patch` (pre-kubelet). See `README-cross-account.md`. |
+| `create-asg.sh` | Creates a launch template and ASG in the satellite region (uses `userdata.template.txt`) |
 
 ## Prerequisites
 
-Before running `create-asg.sh`, complete the cluster-side setup (see `../docs/runbook-phase1.md`):
+Before running `create-asg.sh`, complete the cluster-side setup (full how-to: [../../docs/user-guide.md](../../docs/user-guide.md)):
 
-1. `RemoteNetworkConfig` includes the satellite VPC CIDR
-2. `HYBRID_LINUX` access entry on the cluster for `CrossRegionNodeRole`
-3. Cluster security group allows TCP 443 from the satellite VPC CIDR
+1. **IAM** — node role + instance profile + `HYBRID_LINUX` access entry:
+   `xrnctl setup-iam --cluster-name <name> --cluster-region <region> --node-role-name CrossRegionNodeRole`
+2. **Register the satellite** — SNAT CIDRs + `RemoteNetworkConfig`:
+   `xrnctl add-satellite --cluster-name <name> --cluster-region <region> --vpc-id <vpc> --satellite-region <region>`
+3. Cluster security group allows TCP 443 (+ 53/pods/10250) from the satellite VPC CIDR; satellite SG allows pods/10250 from the cluster CIDR
 4. TGW peering / routes between cluster and satellite VPCs
-5. SNAT exclusion CIDRs set via `xrnctl add-region`
-6. **xrn-install released** to <https://github.com/jicowan/eks-cross-region-nodes/releases>
+5. **xrn-install released** to <https://github.com/jicowan/eks-cross-region-nodes/releases>
    - The user-data uses `releases/latest/download/xrn-install-linux-amd64`
    - At least one release with that asset attached must exist before the first instance launches
 
@@ -78,7 +85,7 @@ aws autoscaling set-desired-capacity --region <satellite-region> \
    - Runs `xrn-install init --cluster-name X --cluster-region Y`
    - `xrn-install` detects nodeadm already ran, skips bootstrap, applies the 5 cross-region kubelet patches, restarts kubelet
 4. kubelet registers with the cluster as `system:node:<instance-id>`
-5. (Manual) Approve the kubelet-serving CSR — see `../docs/runbook-phase1.md` §9.2
+5. (Manual) Approve the kubelet-serving CSR — see the main [README "Post-join: kubelet serving certificate"](../../README.md#post-join-kubelet-serving-certificate) section
 
 ## Troubleshooting
 

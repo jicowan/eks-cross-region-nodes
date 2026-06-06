@@ -9,31 +9,39 @@ Tools for joining EC2 worker nodes in satellite VPCs/regions to an EKS cluster i
 > nodes ride the stock `aws-node` with `compute-type=cross-region`.
 >
 > **Start here:** [docs/user-guide.md](./docs/user-guide.md) — operator how-to for `xrn-install` and
-> `xrnctl` (both topologies). Design + rationale: [docs/PRD-cross-account-nodes.md](./docs/PRD-cross-account-nodes.md).
-> Implementation/validation record: [docs/gap-analysis.md](./docs/gap-analysis.md).
+> `xrnctl` (both topologies). System-level reference: [docs/architecture.md](./docs/architecture.md).
 
 ## Components
 
-### `xrn-install` (Phase 3)
+### `xrn-install`
 
-On-node installer that bootstraps a satellite EC2 instance into a cross-region EKS cluster. Replaces the manual user-data fixup documented in the Phase 1 runbook.
+On-node installer that bootstraps a satellite EC2 instance into a cross-region (or cross-account) EKS cluster.
 
-**What it does:**
-1. Discovers cluster configuration via `eks:DescribeCluster` (cross-region)
-2. Discovers node metadata from IMDS
-3. Runs pre-flight checks (API endpoint reachable, DNS resolves, regions differ)
-4. Invokes `nodeadm init` with discovered config
-5. Patches kubelet configuration for cross-region operation:
+**Subcommands:** `init` (post-boot: discover + preflight + nodeadm + patch + restart — the
+same-account/cross-region path), `patch` (patch only, no nodeadm/restart — run from a kubelet
+`ExecStartPre` for the **cross-account** pre-kubelet flow), `preflight`, `discover`. See the
+[user guide](./docs/user-guide.md#xrn-install) for the cross-account boothook setup.
+
+**What `init`/`patch` do:**
+1. Discover cluster config via `eks:DescribeCluster` — assuming the cluster-account role first when `--cluster-account-role-arn` is set (cross-account; the instance role can't see a cluster in another account)
+2. Discover node metadata from IMDS
+3. (`init`) run pre-flight checks; (`init`) invoke `nodeadm init`
+4. Patch kubelet for cross-region operation:
    - `--cloud-provider=""` (prevents CCM from deleting the node)
    - `--hostname-override=<instance-id>` (matches HYBRID_LINUX identity)
    - `providerID=eks-hybrid:///<cluster-region>/<cluster-name>/<instance-id>`
    - Topology labels via `--node-labels`
-   - Kubeconfig region set to cluster region (for valid STS token)
-6. Restarts kubelet
+   - Kubeconfig: cluster region for STS (same-account), **or** an AssumeRole credential helper (cross-account, via `--cluster-account-role-arn`)
+5. (`init`) restart kubelet
 
 **Usage:**
 ```bash
+# same-account / cross-region (post-boot)
 xrn-install init --cluster-name my-cluster --cluster-region us-east-2
+
+# cross-account (from a kubelet ExecStartPre drop-in; see the user guide)
+xrn-install patch --cluster-name my-cluster --cluster-region us-east-2 \
+  --cluster-account-role-arn arn:aws:iam::<cluster-acct>:role/XrnSatelliteNodeRole
 ```
 
 **Prerequisites:**
@@ -46,75 +54,84 @@ xrn-install init --cluster-name my-cluster --cluster-region us-east-2
   - `AmazonEKS_CNI_Policy`
   - `AmazonSSMManagedInstanceCore` (optional, for debugging)
 - IAM role must also allow `eks:ListAccessEntries` and `eks:DescribeAccessEntry` (for `xrn-install`'s preflight check). Add as an inline policy — see [docs/runbook-phase1.md §4](docs/runbook-phase1.md#4-iam-for-the-worker-node).
-- (Only if using custom networking) ENIConfig CRs created for this node's AZ via `xrnctl add-region --with-eniconfigs`
+- (Only if using custom networking) ENIConfig CRs created for this node's AZ via `xrnctl add-satellite --with-eniconfigs`
 
-### `xrnctl` (Phase 4)
+### `xrnctl`
 
-Cluster-admin tool for managing satellite regions. Runs from an operator workstation with kubectl access to the cluster.
+Cluster-admin tool for managing satellites. Runs from an operator workstation with kubectl access to the cluster. Full reference: **[docs/user-guide.md](./docs/user-guide.md)**.
 
 **What it does:**
-- Maintains the `aws-node-vpc-cidrs` ConfigMap (SNAT exclusion CIDRs + registry metadata)
-- Validates CIDR non-overlap when adding a new region
-- Optionally creates/deletes `ENIConfig` CRs (only when custom networking is required)
-- Refuses to remove a region with nodes still registered
-- Detects configuration drift
+- `setup-iam` — creates the node IAM role + instance profile and the `HYBRID_LINUX` access entry. For cross-account, creates **both** the satellite-account node role and the cluster-account role it assumes, wiring the trust both ways (`--profile` selects the account per run).
+- `add-satellite` — maintains the `aws-node-vpc-cidrs` ConfigMap (SNAT CIDRs + registry), updates the cluster's `RemoteNetworkConfig`, and for **cross-account** renders + applies the dedicated `aws-node-satellite-<acct>-<region>` DaemonSet. Validates CIDR non-overlap.
+- `remove-satellite` — deregisters a satellite; refuses if nodes are still registered.
+- `list-satellites` — lists registered satellites (region, account, CIDRs, ENIConfigs).
+- `verify` — detects drift between the ConfigMap, ENIConfigs, and node labels.
+- Optionally creates/deletes `ENIConfig` CRs (only when custom networking is required).
 
 **Usage:**
 ```bash
-# Register a new satellite VPC (default: no ENIConfigs, pods use the node's subnet)
-xrnctl add-region \
+# Register a same-account / cross-region satellite (CIDRs auto-discovered)
+xrnctl add-satellite \
   --cluster-name main --cluster-region us-east-2 \
   --vpc-id vpc-09c3d15c27ab543c5 --satellite-region eu-west-1
 
-# Or with custom networking (pods need a different subnet/SG than the node)
-xrnctl add-region \
+# Register a CROSS-ACCOUNT satellite (--account-id + --vpc-cidr required;
+# xrnctl can't DescribeVpcs in another account). Renders + applies the dedicated DaemonSet.
+xrnctl add-satellite \
   --cluster-name main --cluster-region us-east-2 \
-  --vpc-id vpc-09c3d15c27ab543c5 --satellite-region eu-west-1 \
-  --with-eniconfigs \
-  --subnet-ids subnet-aaa,subnet-bbb \
-  --security-group-ids sg-xxx
+  --vpc-id vpc-bbbb --satellite-region us-west-1 \
+  --account-id 310444902345 --vpc-cidr 10.2.0.0/16
 
 # List all registered satellites
-xrnctl list-regions --cluster-name main --cluster-region us-east-2
+xrnctl list-satellites --cluster-name main --cluster-region us-east-2
 
 # Verify consistency
 xrnctl verify --cluster-name main --cluster-region us-east-2
 
 # Remove a satellite (fails if nodes still present)
-xrnctl remove-region --cluster-name main --cluster-region us-east-2 --vpc-id vpc-09c3d15c27ab543c5
+xrnctl remove-satellite --cluster-name main --cluster-region us-east-2 --vpc-id vpc-09c3d15c27ab543c5
 ```
 
-**What `add-region` does by default:**
-- Updates `kube-system/aws-node-vpc-cidrs` ConfigMap:
-  - `exclude-snat-cidrs` — all VPC CIDRs (cluster + all satellites), newline-separated
-  - `registry.json` — full satellite metadata for verify/remove operations
+**What `add-satellite` does by default:**
+- Updates `kube-system/aws-node-vpc-cidrs` ConfigMap (`exclude-snat-cidrs` + `registry.json`).
+- Updates the cluster's `RemoteNetworkConfig.remoteNodeNetworks` with the satellite CIDR.
+- For cross-account (`--account-id` differs from the cluster account): renders and applies the
+  dedicated `aws-node-satellite-<acct>-<region>` DaemonSet (use `--dry-run` to print instead).
 
-**With `--with-eniconfigs`:**
-- Additionally creates one `ENIConfig` per AZ in the satellite VPC (name = AZ name, e.g., `eu-west-1b`)
-- Required only when pods must use a different subnet or security group than the node. For most cross-region setups, the default (no ENIConfigs) is preferred — the VPC CNI auto-discovers the node's subnet via IMDS.
+**With `--with-eniconfigs --security-group-ids sg-x[,sg-y]`:** additionally creates one `ENIConfig`
+per AZ. Only needed when pods must use a different subnet/SG than the node; otherwise the VPC CNI
+uses the node's own subnet (auto-discovered via IMDS).
 
 **Prerequisites:**
 - kubectl access to the cluster (kubeconfig configured)
-- AWS credentials with `ec2:DescribeVpcs` in the satellite region and `eks:DescribeCluster` in the cluster region
-- The satellite VPC must already exist with subnets and security groups created
+- AWS credentials for the cluster account (`eks:DescribeCluster`, `eks:UpdateClusterConfig`,
+  and — same-account only — `ec2:DescribeVpcs` in the satellite region). `setup-iam` additionally
+  needs IAM write permissions; cross-account runs use `--profile` to target each account.
 
 **What `verify` checks:**
-- Every satellite in `registry.json` has matching ENIConfigs in the cluster
-- Every CIDR in `registry.json` is present in `exclude-snat-cidrs`
-- Every node labeled `compute-type=cross-region` has an ENIConfig for its AZ
+- Every CIDR in `registry.json` is present in `exclude-snat-cidrs`.
+- Satellites registered `--with-eniconfigs` have their `ENIConfig` CRs present.
+- Every satellite node (`compute-type` in `cross-region`/`hybrid`) carries a
+  `topology.kubernetes.io/zone` label. (ENIConfigs are optional, so their absence is not drift.)
 
 ## Bootstrapping a satellite node with `xrn-install`
+
+> This walkthrough is the **same-account / cross-region** flow (post-boot `xrn-install init`).
+> For **cross-account** satellites, the node must be patched *before* kubelet's first start via a
+> cloud-boothook + `xrn-install patch` drop-in — see the
+> [user guide](./docs/user-guide.md#cross-account-pre-kubelet-patch) and
+> `deploy/asg/userdata-cross-account.template.txt`.
 
 ### Step 1: Set up prerequisites (one-time, per satellite region)
 
 Before any node can join, the cluster-admin must:
 
-1. Create a `CrossRegionNodeRole` with a `HYBRID_LINUX` access entry on the cluster
+1. Create the node IAM role + `HYBRID_LINUX` access entry: `xrnctl setup-iam --cluster-name <name> --cluster-region <region> --node-role-name CrossRegionNodeRole` (same-account). For cross-account, see the two-step flow in the [user guide](./docs/user-guide.md#setup-iam--create-iam-prerequisites).
 2. Establish network connectivity (TGW/peering + cluster SG allows TCP 443 from satellite VPC)
-3. Register the satellite region: `xrnctl add-region --cluster-name <name> --cluster-region <region> --vpc-id <vpc> --satellite-region <region>`
+3. Register the satellite: `xrnctl add-satellite --cluster-name <name> --cluster-region <region> --vpc-id <vpc> --satellite-region <region>` (add `--account-id` + `--vpc-cidr` for cross-account)
 4. (Only if using custom networking) Add `--with-eniconfigs` to step 3 and enable custom networking on the aws-node DaemonSet
 
-See [docs/runbook-phase1.md](docs/runbook-phase1.md) for the full walkthrough.
+See the [user guide](./docs/user-guide.md) for the full walkthrough (both topologies).
 
 ### Step 2: Build user-data for AL2023
 
@@ -213,21 +230,7 @@ After Step 4:
 
 For multi-region satellite topologies (ASGs in 3+ regions), see the "Adding more satellite ASGs" section of [deploy/cluster-autoscaler/README.md](deploy/cluster-autoscaler/README.md).
 
-### What `xrn-install init` does
-
-When invoked after nodeadm has already bootstrapped:
-
-1. Discovers cluster config via `eks:DescribeCluster` (confirms cluster-name/region)
-2. Reads node metadata from IMDS (instance ID, AZ, region)
-3. Runs pre-flight checks (endpoint reachable, IMDS hop limit, cross-region confirmed)
-4. Patches kubelet:
-   - `--cloud-provider=""` — prevents CCM from deleting the node
-   - `--hostname-override=<instance-id>` — matches `HYBRID_LINUX` identity
-   - `providerID=eks-hybrid:///<cluster-region>/<cluster-name>/<instance-id>`
-   - `--node-labels` with `topology.kubernetes.io/zone` and `/region`
-   - kubeconfig `--region` set to cluster region (for valid STS token)
-5. Restarts kubelet
-
+(For what `xrn-install init`/`patch` do step-by-step, see the [`xrn-install`](#xrn-install) component section above.)
 
 ## Post-join: kubelet serving certificate
 
@@ -304,7 +307,8 @@ make test
 
 ## Architecture
 
-See [docs/PRD-cross-region-nodes.md](docs/PRD-cross-region-nodes.md)
+See [docs/architecture.md](docs/architecture.md) — system-level reference (topologies, the CCM
+reap, credential chains, bootstrap sequencing, data plane).
 
 ## Requirements
 

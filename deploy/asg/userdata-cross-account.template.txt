@@ -21,6 +21,10 @@ date
 CLUSTER_NAME=${CLUSTER_NAME}
 CLUSTER_REGION=${CLUSTER_REGION}
 SATELLITE_ROLE_ARN=${SATELLITE_ROLE_ARN}
+# Optional sts:ExternalId. Leave the substitution empty if the cluster-account role's trust
+# policy does not require one; if it does, set it to the same value passed to
+# `xrnctl setup-iam --external-id`.
+EXTERNAL_ID="${EXTERNAL_ID}"
 XRN_URL="${XRN_INSTALL_URL}"
 
 # 1. Download xrn-install.
@@ -30,10 +34,14 @@ chmod +x /usr/local/bin/xrn-install
 # 2. Kubelet drop-in: run the patch as ExecStartPre. kubelet.service is ordered
 #    After=nodeadm-config.service, so the config files exist by the time this runs, and
 #    kubelet's main process will not start until the patch succeeds.
+EXTERNAL_ID_ARG=""
+if [ -n "$EXTERNAL_ID" ]; then
+  EXTERNAL_ID_ARG=" --cluster-account-external-id $EXTERNAL_ID"
+fi
 mkdir -p /etc/systemd/system/kubelet.service.d
 cat > /etc/systemd/system/kubelet.service.d/99-xrn-patch.conf <<DROP
 [Service]
-ExecStartPre=/usr/local/bin/xrn-install patch --cluster-name ${CLUSTER_NAME} --cluster-region ${CLUSTER_REGION} --cluster-account-role-arn ${SATELLITE_ROLE_ARN}
+ExecStartPre=/usr/local/bin/xrn-install patch --cluster-name ${CLUSTER_NAME} --cluster-region ${CLUSTER_REGION} --cluster-account-role-arn ${SATELLITE_ROLE_ARN}${EXTERNAL_ID_ARG}
 DROP
 
 systemctl daemon-reload

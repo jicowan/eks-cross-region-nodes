@@ -39,7 +39,8 @@ These are preconditions the tools do **not** create:
 - **Cluster auth mode:** `API` or `API_AND_CONFIG_MAP` (access entries are required; the
   `aws-auth` ConfigMap does not support the `HYBRID_LINUX` type).
 - **A kubelet-serving CSR auto-approver** if you want `kubectl logs/exec` to satellite pods
-  (EKS does not auto-approve these for satellite nodes). See PRD §13.2.
+  (EKS does not auto-approve these for satellite nodes). See the README "Post-join: kubelet serving
+  certificate" section.
 
 ---
 
@@ -66,9 +67,8 @@ EC2 trust) **and** the `HYBRID_LINUX` access entry for it — all in the cluster
 
 **Cross-account (two runs, two profiles).** The cross-account auth chain is:
 `EC2 → XrnNodeRole (satellite acct) → XrnSatelliteNodeRole (cluster acct) → kubelet identity`.
-`setup-iam` creates **both** roles and wires the trust in both directions — nothing is left for
-you to hand-craft. Pick predictable names up front; the cluster role's ARN is referenced by both
-runs.
+`setup-iam` creates **both** roles and wires the trust in both directions. Pick predictable names 
+up front; the cluster role's ARN is referenced by both runs.
 
 ```bash
 SAT_ACCT=310444902345

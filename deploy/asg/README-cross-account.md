@@ -43,14 +43,33 @@ account mismatch and installs the AssumeRole credential helper for kubelet auth.
 | `${CLUSTER_SERVICE_CIDR}` | service CIDR |
 | `${SATELLITE_ROLE_ARN}` | `arn:aws:iam::<cluster-acct>:role/XrnSatelliteNodeRole` — assumed for kubelet creds |
 | `${SATELLITE_ACCOUNT_ID}` | the satellite account ID (sets the node label used by the dedicated DaemonSet's nodeAffinity) |
+| `${EXTERNAL_ID}` | optional `sts:ExternalId`; leave empty unless the cluster role's trust policy requires one (must match `xrnctl setup-iam --external-id`) |
 | `${XRN_INSTALL_URL}` | URL to download the `xrn-install` binary |
 
-## Prerequisites (operator-provisioned, out of band)
+## Prerequisites
 
-- `XrnNodeRole` + instance profile in the **satellite** account (use `xrnctl setup-iam --profile <satellite> --node-role-only`)
-- `XrnSatelliteNodeRole` in the **cluster** account, trusting the satellite node role, with a
-  `HYBRID_LINUX` access entry (use `xrnctl setup-iam --profile <cluster> --access-entry-only --node-role-arn <satellite-role>`)
-- The dedicated `aws-node-satellite-<acct>-<region>` DaemonSet applied to the cluster
-  (`xrnctl add-satellite --account-id <satellite-acct> …`)
-- TGW peering + routes, cluster SG inbound from the satellite CIDR (DNS/pods/kubelet), and the
-  satellite VPC CIDR in the cluster's `RemoteNetworkConfig` (the last one is handled by `add-satellite`)
+IAM (both roles + bidirectional trust, created by `xrnctl setup-iam` — see the
+[user guide](../../docs/user-guide.md#setup-iam--create-iam-prerequisites)):
+
+```bash
+# satellite account: node role + instance profile + AssumeRole grant on the cluster role
+xrnctl setup-iam --profile <satellite> --cluster-name <name> --cluster-region <region> \
+  --node-role-name XrnNodeRole --node-role-only \
+  --satellite-role-arn arn:aws:iam::<cluster-acct>:role/XrnSatelliteNodeRole
+# cluster account: create XrnSatelliteNodeRole (trust + eks:DescribeCluster) + access entry
+xrnctl setup-iam --profile <cluster> --cluster-name <name> --cluster-region <region> \
+  --create-satellite-role \
+  --trusted-node-role-arn arn:aws:iam::<satellite-acct>:role/XrnNodeRole
+```
+
+Cluster state:
+
+- The dedicated `aws-node-satellite-<acct>-<region>` DaemonSet applied to the cluster, plus the
+  satellite VPC CIDR in the cluster's `RemoteNetworkConfig` — both handled by
+  `xrnctl add-satellite --account-id <satellite-acct> --vpc-cidr <cidr> …`.
+
+Operator-provisioned (out of band):
+
+- TGW peering + routes between the cluster and satellite VPCs.
+- Cluster SG inbound from the satellite CIDR (TCP 443, TCP+UDP 53, TCP 1024–65535, TCP 10250);
+  satellite SG inbound from the cluster CIDR (TCP 1024–65535, TCP 10250).
