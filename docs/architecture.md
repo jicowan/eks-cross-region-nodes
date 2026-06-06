@@ -185,6 +185,18 @@ Validated end-to-end (2026-06-06): a cross-account satellite pod resolves CoreDN
 kube-apiserver Service, reaches a cluster-VPC pod with its source IP intact, and reaches the
 internet. Satellite-to-satellite traffic is out of scope (hub-and-spoke only).
 
+**Persistent storage** on satellite nodes is more constrained than networking — EBS is
+AZ/region/account-locked and the EBS CSI controller hits the same credential/region walls as the
+CNI (and additionally requires a forked, renamed driver to run per-account). Node-local storage
+(EC2 Instance Store CSI) is the clean fit because it makes no AWS API calls. See
+[storage-options.md](./storage-options.md).
+
+**Exposing satellite pods through a load balancer** uses the AWS Load Balancer Controller's
+`TargetGroupBinding` with `ip` target type: a pre-provisioned NLB/ALB registers satellite pod IPs
+(routable over the TGW), with built-in fields for cross-VPC (`vpcID`) and cross-account
+(`iamRoleArnToAssume`) target groups. The auto-provision-from-annotations path is single-VPC only.
+See [load-balancing.md](./load-balancing.md).
+
 ## 8. What this project does NOT change
 
 - The VPC CNI's IPAM model (custom networking already does the right thing per-region).
