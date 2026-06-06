@@ -56,7 +56,8 @@ type Manager struct {
 type AddRegionInput struct {
 	VPCID            string
 	SatelliteRegion  string
-	AccountID        string // AWS account the satellite VPC lives in; empty = cluster's own account
+	AccountID        string   // AWS account the satellite VPC lives in; empty = cluster's own account
+	VPCCIDRs         []string // explicit CIDRs; when set, skip DescribeVpcs (needed for cross-account, where the manager lacks satellite-account creds)
 	SubnetIDs        []string
 	SecurityGroupIDs []string
 	WithENIConfigs   bool
@@ -135,10 +136,39 @@ func loadAWSConfig(ctx context.Context, region, profile string) (aws.Config, err
 }
 
 func (m *Manager) AddRegion(ctx context.Context, input *AddRegionInput) (*AddRegionResult, error) {
-	// 1. Discover satellite VPC CIDRs
-	cidrs, err := m.getVPCCIDRs(ctx, input.VPCID, input.SatelliteRegion)
-	if err != nil {
-		return nil, fmt.Errorf("getting VPC CIDRs: %w", err)
+	// 1. Determine satellite VPC CIDRs. Prefer explicit --vpc-cidr (required for cross-account,
+	// where the manager has only cluster-account creds and can't DescribeVpcs the satellite VPC);
+	// otherwise discover them via EC2 (same-account path).
+	var cidrs []string
+	if len(input.VPCCIDRs) > 0 {
+		cidrs = input.VPCCIDRs
+	} else {
+		var err error
+		cidrs, err = m.getVPCCIDRs(ctx, input.VPCID, input.SatelliteRegion)
+		if err != nil {
+			return nil, fmt.Errorf("getting VPC CIDRs (pass --vpc-cidr explicitly for cross-account satellites): %w", err)
+		}
+	}
+
+	// Dry-run: preview only, no mutations. Render the cross-account DS (if applicable) and
+	// return without touching the ConfigMap, RemoteNetworkConfig, ENIConfigs, or the cluster.
+	if input.DryRun {
+		crossAccount, _ := m.isCrossAccount(ctx, input.AccountID)
+		result := &AddRegionResult{CIDRs: cidrs, CrossAccount: crossAccount}
+		if crossAccount {
+			manifest, derr := satellite.Render(satellite.Params{
+				AccountID:        input.AccountID,
+				Region:           input.SatelliteRegion,
+				ClusterName:      m.clusterName,
+				ExcludeSNATCIDRs: append(m.allExcludeSNATCIDRs(ctx), cidrs...),
+			})
+			if derr != nil {
+				return nil, fmt.Errorf("rendering satellite DaemonSet: %w", derr)
+			}
+			result.SatelliteDS = satellite.Params{AccountID: input.AccountID, Region: input.SatelliteRegion}.Name()
+			result.SatelliteManifest = manifest
+		}
+		return result, nil
 	}
 
 	// Idempotency: if this VPC is already registered, this is a re-run. Skip the overlap
@@ -156,12 +186,30 @@ func (m *Manager) AddRegion(ctx context.Context, input *AddRegionInput) (*AddReg
 			remoteNetworkStatus = "skipped"
 		}
 		crossAccount, _ := m.isCrossAccount(ctx, input.AccountID)
-		return &AddRegionResult{
+		result := &AddRegionResult{
 			CIDRs:               cidrs,
 			RemoteNetworkUpdate: remoteNetworkStatus,
 			CrossAccount:        crossAccount,
 			AlreadyRegistered:   true,
-		}, nil
+		}
+		// Ensure the cross-account DaemonSet exists even on a re-run (it may have been deleted,
+		// or never applied if a prior run failed after registering). applyManifest is idempotent.
+		if crossAccount {
+			manifest, derr := satellite.Render(satellite.Params{
+				AccountID:        input.AccountID,
+				Region:           input.SatelliteRegion,
+				ClusterName:      m.clusterName,
+				ExcludeSNATCIDRs: m.allExcludeSNATCIDRs(ctx),
+			})
+			if derr != nil {
+				return nil, fmt.Errorf("rendering satellite DaemonSet: %w", derr)
+			}
+			result.SatelliteDS = satellite.Params{AccountID: input.AccountID, Region: input.SatelliteRegion}.Name()
+			if aerr := m.applyManifest(ctx, manifest); aerr != nil {
+				return nil, fmt.Errorf("applying satellite DaemonSet: %w", aerr)
+			}
+		}
+		return result, nil
 	}
 
 	// 2. Check for CIDR overlap with existing entries
@@ -238,9 +286,8 @@ func (m *Manager) AddRegion(ctx context.Context, input *AddRegionInput) (*AddReg
 			return nil, fmt.Errorf("rendering satellite DaemonSet: %w", derr)
 		}
 		result.SatelliteDS = satellite.Params{AccountID: input.AccountID, Region: input.SatelliteRegion}.Name()
-		if input.DryRun {
-			result.SatelliteManifest = manifest
-		} else if aerr := m.applyManifest(ctx, manifest); aerr != nil {
+		// Dry-run is handled earlier (short-circuits before any mutation); here we always apply.
+		if aerr := m.applyManifest(ctx, manifest); aerr != nil {
 			return nil, fmt.Errorf("applying satellite DaemonSet: %w", aerr)
 		}
 	}
@@ -544,22 +591,23 @@ func (m *Manager) Verify(ctx context.Context) ([]string, error) {
 		}
 	}
 
-	// Check nodes with cross-region label have matching ENIConfigs
+	// Check satellite nodes carry a topology.kubernetes.io/zone label (needed for scheduling
+	// and, when custom networking is in use, ENIConfig selection). Satellite nodes use either
+	// compute-type=cross-region (same-account) or compute-type=hybrid (cross-account).
+	//
+	// ENIConfig presence is NOT required: custom networking is opt-in (a satellite registered
+	// without --with-eniconfigs uses the node's own subnet). We only flag a missing zone label,
+	// not a missing ENIConfig. ENIConfig drift for satellites that DO use custom networking is
+	// already covered above by the registry.ENIConfigNames check.
 	nodeList, err := m.k8sClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{
-		LabelSelector: "eks.amazonaws.com/compute-type=cross-region",
+		LabelSelector: "eks.amazonaws.com/compute-type in (cross-region,hybrid)",
 	})
 	if err != nil {
 		issues = append(issues, fmt.Sprintf("Cannot list nodes: %v", err))
 	} else {
 		for _, node := range nodeList.Items {
-			zone := node.Labels["topology.kubernetes.io/zone"]
-			if zone == "" {
-				issues = append(issues, fmt.Sprintf("Node %s has compute-type=cross-region but no topology.kubernetes.io/zone label", node.Name))
-				continue
-			}
-			exists, _ := m.eniConfigExists(ctx, zone)
-			if !exists {
-				issues = append(issues, fmt.Sprintf("Node %s is in zone %s but no ENIConfig named %s exists", node.Name, zone, zone))
+			if node.Labels["topology.kubernetes.io/zone"] == "" {
+				issues = append(issues, fmt.Sprintf("Satellite node %s has no topology.kubernetes.io/zone label", node.Name))
 			}
 		}
 	}

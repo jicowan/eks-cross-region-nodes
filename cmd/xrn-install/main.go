@@ -75,9 +75,11 @@ func runInit(ctx context.Context) int {
 		return 1
 	}
 
-	// Step 1: Discover cluster configuration
+	// Step 1: Discover cluster configuration. On cross-account nodes the instance role can't
+	// see the cluster, so DescribeClusterWithRole assumes the cluster-account role first when
+	// --cluster-account-role-arn is set.
 	fmt.Println("[1/4] Discovering cluster configuration...")
-	cluster, err := discovery.DescribeCluster(ctx, cfg.ClusterName, cfg.ClusterRegion)
+	cluster, err := discovery.DescribeClusterWithRole(ctx, cfg.ClusterName, cfg.ClusterRegion, cfg.ClusterAccountRoleARN, cfg.ClusterAccountExtID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to discover cluster: %v\n", err)
 		return 12
@@ -159,7 +161,7 @@ func runPatch(ctx context.Context) int {
 		return 1
 	}
 
-	cluster, err := discovery.DescribeCluster(ctx, cfg.ClusterName, cfg.ClusterRegion)
+	cluster, err := discovery.DescribeClusterWithRole(ctx, cfg.ClusterName, cfg.ClusterRegion, cfg.ClusterAccountRoleARN, cfg.ClusterAccountExtID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to discover cluster: %v\n", err)
 		return 12

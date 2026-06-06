@@ -55,14 +55,36 @@ func TestParseAddSatelliteFlags(t *testing.T) {
 			},
 		},
 		{
-			name: "cross-account with account-id",
+			name: "cross-account with account-id and vpc-cidr",
+			args: []string{"xrnctl", "add-satellite",
+				"--cluster-name", "main", "--cluster-region", "us-east-2",
+				"--vpc-id", "vpc-abc", "--satellite-region", "us-west-1",
+				"--account-id", "310444902345", "--vpc-cidr", "10.2.0.0/16"},
+			check: func(t *testing.T, c *addSatelliteConfig) {
+				if c.AccountID != "310444902345" {
+					t.Errorf("AccountID = %q, want 310444902345", c.AccountID)
+				}
+				if len(c.VPCCIDRs) != 1 || c.VPCCIDRs[0] != "10.2.0.0/16" {
+					t.Errorf("VPCCIDRs = %v, want [10.2.0.0/16]", c.VPCCIDRs)
+				}
+			},
+		},
+		{
+			name: "cross-account without vpc-cidr is rejected",
 			args: []string{"xrnctl", "add-satellite",
 				"--cluster-name", "main", "--cluster-region", "us-east-2",
 				"--vpc-id", "vpc-abc", "--satellite-region", "us-west-1",
 				"--account-id", "310444902345"},
+			wantErr: true,
+		},
+		{
+			name: "same-account does not require vpc-cidr",
+			args: []string{"xrnctl", "add-satellite",
+				"--cluster-name", "main", "--cluster-region", "us-east-2",
+				"--vpc-id", "vpc-abc", "--satellite-region", "eu-west-1"},
 			check: func(t *testing.T, c *addSatelliteConfig) {
-				if c.AccountID != "310444902345" {
-					t.Errorf("AccountID = %q, want 310444902345", c.AccountID)
+				if c.AccountID != "" {
+					t.Errorf("AccountID should be empty, got %q", c.AccountID)
 				}
 			},
 		},

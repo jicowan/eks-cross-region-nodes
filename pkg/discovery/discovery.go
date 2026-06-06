@@ -9,8 +9,10 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"github.com/aws/aws-sdk-go-v2/service/eks"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
 type ClusterInfo struct {
@@ -38,9 +40,28 @@ type NodeMetadata struct {
 }
 
 func DescribeCluster(ctx context.Context, clusterName, clusterRegion string) (*ClusterInfo, error) {
+	return DescribeClusterWithRole(ctx, clusterName, clusterRegion, "", "")
+}
+
+// DescribeClusterWithRole is like DescribeCluster but, when assumeRoleARN is non-empty,
+// first assumes that role (in the cluster account) and uses the resulting credentials for
+// eks:DescribeCluster. This is the cross-account path: the satellite instance role can't
+// see a cluster in another account, so it must assume the cluster-account role first.
+func DescribeClusterWithRole(ctx context.Context, clusterName, clusterRegion, assumeRoleARN, externalID string) (*ClusterInfo, error) {
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(clusterRegion))
 	if err != nil {
 		return nil, fmt.Errorf("loading AWS config for region %s: %w", clusterRegion, err)
+	}
+
+	if assumeRoleARN != "" {
+		stsClient := sts.NewFromConfig(cfg)
+		provider := stscreds.NewAssumeRoleProvider(stsClient, assumeRoleARN, func(o *stscreds.AssumeRoleOptions) {
+			o.RoleSessionName = "xrn-install-discovery"
+			if externalID != "" {
+				o.ExternalID = aws.String(externalID)
+			}
+		})
+		cfg.Credentials = aws.NewCredentialsCache(provider)
 	}
 
 	client := eks.NewFromConfig(cfg)

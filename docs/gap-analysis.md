@@ -175,6 +175,23 @@ Both tracks landed, back-to-back, all unit-tested. Not yet live-tested end-to-en
 
 **Still owed:** end-to-end live test of a cross-account node through the full toolchain (setup-iam two-profile → add-satellite → ASG with the cross-account userdata). The `setup-iam --profile root` flow has not been run live yet.
 
+## 5e. Cross-account live-test findings (2026-06-06)
+
+Live-tested the cross-account toolchain against the lab (release v0.1.4 has the new code).
+
+**Validated working:**
+- `setup-iam` two-profile flow: `--profile root --node-role-only` created XrnNodeRole + instance profile in the satellite account (310444902345); default-profile `--access-entry-only` verified the cluster-account access entry. The `--profile` design works across two accounts.
+- `add-satellite --account-id 310444902345`: correct cross-account detection, rendered + applied the generated `aws-node-satellite-310444902345-us-west-1` DS, which scheduled onto the existing cross-account node and reached 2/2 Running (IPAMD healthy via IMDS, no InvalidToken). Node stayed Ready.
+- `--dry-run` now previews with **zero mutations** (see bug 2).
+- `list-satellites` shows both satellites with correct account columns.
+
+**Bugs found and fixed during the live test:**
+1. **Cross-account VPC lookup (blocker).** `add-satellite` called `DescribeVpcs` for the satellite VPC using cluster-account creds → `InvalidVpcID.NotFound`. Fix: added `--vpc-cidr` (required when `--account-id` is set) so the operator supplies CIDRs explicitly; skips the EC2 lookup. xrnctl never needs satellite-account creds.
+2. **`--dry-run` mutated state.** It only skipped the DS apply but still wrote the ConfigMap + RemoteNetworkConfig. Fix: dry-run now short-circuits before any mutation, rendering the DS for preview only.
+3. **already-registered re-run skipped the DS.** Re-running `add-satellite` for a registered cross-account VPC didn't ensure the DS exists. Fix: the already-registered path now (idempotently) re-applies the cross-account DS.
+4. **`verify` false positives + blind spot.** It (a) flagged missing ENIConfigs as drift even though ENIConfigs are optional, and (b) only selected `compute-type=cross-region` nodes, so cross-account (`hybrid`) nodes were invisible. Fix: select `compute-type in (cross-region,hybrid)`, and only check for the zone label (not ENIConfig presence) on satellite nodes.
+5. **`xrn-install` discovery failed cross-account (blocker, found in fresh-node boot).** `eks:DescribeCluster` ran with the satellite-account instance role → `ResourceNotFoundException: No cluster found for name: main` (the cluster is in the other account). The `--cluster-account-role-arn` was only consumed later for the kubelet credential helper, not for discovery. Fix: `discovery.DescribeClusterWithRole` assumes the cluster-account role (via STS) before DescribeCluster when the flag is set; `runInit`/`runPatch` pass it through. **Requires a new release** (on-node binary). The ExecStartPre gate correctly held kubelet in a retry loop the whole time — the node never mis-registered, confirming the gate design.
+
 ## 6. Non-gaps (things the PRDs call for that ARE done)
 
 - ConfigMap as canonical registry (not SSM) — done, matches PRD §5 decision.

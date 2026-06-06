@@ -46,7 +46,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, `xrnctl — Cross-region / cross-account EKS cluster admin tool
 
 Usage:
-  xrnctl add-satellite     --cluster-name NAME --cluster-region REGION --vpc-id VPC --satellite-region REGION [--account-id ACCT] [--dry-run] [--with-eniconfigs] [--subnet-ids s1,s2] [--security-group-ids sg1,sg2]
+  xrnctl add-satellite     --cluster-name NAME --cluster-region REGION --vpc-id VPC --satellite-region REGION [--account-id ACCT] [--vpc-cidr c1,c2] [--dry-run] [--with-eniconfigs] [--subnet-ids s1,s2] [--security-group-ids sg1,sg2]
   xrnctl remove-satellite  --cluster-name NAME --cluster-region REGION --vpc-id VPC
   xrnctl list-satellites   --cluster-name NAME --cluster-region REGION
   xrnctl setup-iam         --cluster-name NAME --cluster-region REGION [--node-role-name NAME] [--node-role-arn ARN] [--node-role-only|--access-entry-only] [--profile PROFILE]
@@ -101,6 +101,7 @@ type addSatelliteConfig struct {
 	VPCID            string
 	SatelliteRegion  string
 	AccountID        string
+	VPCCIDRs         []string
 	SubnetIDs        []string
 	SecurityGroupIDs []string
 	WithENIConfigs   bool
@@ -129,6 +130,7 @@ func runAddSatellite(ctx context.Context) int {
 		VPCID:            cfg.VPCID,
 		SatelliteRegion:  cfg.SatelliteRegion,
 		AccountID:        cfg.AccountID,
+		VPCCIDRs:         cfg.VPCCIDRs,
 		SubnetIDs:        cfg.SubnetIDs,
 		SecurityGroupIDs: cfg.SecurityGroupIDs,
 		WithENIConfigs:   cfg.WithENIConfigs,
@@ -384,6 +386,9 @@ func parseAddSatelliteFlags() (*addSatelliteConfig, error) {
 		case "--account-id":
 			i++
 			cfg.AccountID = argValue(args, i)
+		case "--vpc-cidr":
+			i++
+			cfg.VPCCIDRs = splitComma(argValue(args, i))
 		case "--profile":
 			i++
 			cfg.Profile = argValue(args, i)
@@ -412,6 +417,11 @@ func parseAddSatelliteFlags() (*addSatelliteConfig, error) {
 	}
 	if cfg.WithENIConfigs && len(cfg.SecurityGroupIDs) == 0 {
 		return nil, fmt.Errorf("--security-group-ids is required when --with-eniconfigs is set")
+	}
+	// Cross-account satellites need explicit CIDRs: xrnctl runs with cluster-account creds and
+	// cannot DescribeVpcs a VPC in another account.
+	if cfg.AccountID != "" && len(cfg.VPCCIDRs) == 0 {
+		return nil, fmt.Errorf("--vpc-cidr is required for cross-account satellites (--account-id set): xrnctl cannot look up a VPC in another account")
 	}
 	return cfg, nil
 }

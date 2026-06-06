@@ -5,17 +5,19 @@ go 1.26.0
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.12
 	github.com/aws/aws-sdk-go-v2/config v1.32.22
+	github.com/aws/aws-sdk-go-v2/credentials v1.19.21
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.27
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.305.1
 	github.com/aws/aws-sdk-go-v2/service/eks v1.84.4
 	github.com/aws/aws-sdk-go-v2/service/iam v1.54.3
+	github.com/aws/aws-sdk-go-v2/service/sts v1.43.1
 	k8s.io/api v0.36.1
 	k8s.io/apimachinery v0.36.1
 	k8s.io/client-go v0.36.1
+	sigs.k8s.io/yaml v1.6.0
 )
 
 require (
-	github.com/aws/aws-sdk-go-v2/credentials v1.19.21 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.28 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.28 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.28 // indirect
@@ -24,7 +26,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/signin v1.1.3 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sso v1.31.1 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.36.4 // indirect
-	github.com/aws/aws-sdk-go-v2/service/sts v1.43.1 // indirect
 	github.com/aws/smithy-go v1.27.1 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/emicklei/go-restful/v3 v3.13.0 // indirect
@@ -61,5 +62,4 @@ require (
 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect
 	sigs.k8s.io/randfill v1.0.0 // indirect
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.2 // indirect
-	sigs.k8s.io/yaml v1.6.0 // indirect
 )
