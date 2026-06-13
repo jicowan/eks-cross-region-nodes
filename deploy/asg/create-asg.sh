@@ -28,6 +28,8 @@ SATELLITE_SUBNET_IDS="subnet-xxxxxxxxxxxxxxxxx,subnet-yyyyyyyyyyyyyyyyy"  # comm
 SATELLITE_NODE_SG="sg-xxxxxxxxxxxxxxxxx"
 INSTANCE_PROFILE_NAME="CrossRegionNodeProfile"
 INSTANCE_TYPE="m6i.xlarge"
+# URL the node downloads xrn-install from. /latest/download/ redirects to the newest release.
+XRN_INSTALL_URL="https://github.com/jicowan/eks-cross-region-nodes/releases/latest/download/xrn-install-linux-amd64"
 
 LAUNCH_TEMPLATE_NAME="cross-region-${CLUSTER_NAME}-lt"
 ASG_NAME="cross-region-${CLUSTER_NAME}-asg"
@@ -69,6 +71,7 @@ sed \
   -e "s|\${CLUSTER_ENDPOINT}|${ENDPOINT}|g" \
   -e "s|\${CLUSTER_CA}|${CA}|g" \
   -e "s|\${CLUSTER_SERVICE_CIDR}|${SERVICE_CIDR}|g" \
+  -e "s|\${XRN_INSTALL_URL}|${XRN_INSTALL_URL}|g" \
   "${SCRIPT_DIR}/userdata.template.txt" > "$USERDATA_FILE"
 
 # user-data must be base64 for AWS CLI launch template input

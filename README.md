@@ -135,11 +135,26 @@ See the [user guide](./docs/user-guide.md) for the full walkthrough (both topolo
 
 ### Step 2: Build user-data for AL2023
 
-The user-data tells nodeadm how to bootstrap, then invokes `xrn-install` to apply the cross-region patches. Save as `userdata.txt`:
+The user-data tells nodeadm how to bootstrap and installs a kubelet `ExecStartPre` drop-in that runs `xrn-install patch` to apply the cross-region patches before kubelet starts on every boot. Save as `userdata.txt`:
 
 ```
 MIME-Version: 1.0
 Content-Type: multipart/mixed; boundary="BOUNDARY"
+
+--BOUNDARY
+Content-Type: text/cloud-boothook
+
+#!/bin/bash
+# Install xrn-install and a kubelet ExecStartPre drop-in that re-applies the cross-region
+# patches on every kubelet start (survives reboots — see note below).
+curl -sL https://<your-distribution-url>/xrn-install -o /usr/local/bin/xrn-install
+chmod +x /usr/local/bin/xrn-install
+mkdir -p /etc/systemd/system/kubelet.service.d
+cat > /etc/systemd/system/kubelet.service.d/99-xrn-patch.conf <<DROP
+[Service]
+ExecStartPre=/usr/local/bin/xrn-install patch --cluster-name <cluster-name> --cluster-region <cluster-region>
+DROP
+systemctl daemon-reload
 
 --BOUNDARY
 Content-Type: application/node.eks.aws
@@ -158,15 +173,6 @@ spec:
     flags:
       - --node-labels=eks.amazonaws.com/compute-type=cross-region
 
---BOUNDARY
-Content-Type: text/x-shellscript
-
-#!/bin/bash
-# Download and run xrn-install to patch kubelet for cross-region operation
-curl -sL https://<your-distribution-url>/xrn-install -o /tmp/xrn-install
-chmod +x /tmp/xrn-install
-/tmp/xrn-install init --cluster-name <cluster-name> --cluster-region <cluster-region>
-
 --BOUNDARY--
 ```
 
@@ -177,7 +183,9 @@ aws eks describe-cluster --region <cluster-region> --name <cluster-name> \
   --query 'cluster.{endpoint:endpoint,ca:certificateAuthority.data,cidr:kubernetesNetworkConfig.serviceIpv4Cidr}'
 ```
 
-> **How the two parts work together:** Part 1 (`application/node.eks.aws`) runs nodeadm, which bootstraps kubelet with the cluster endpoint/CA. Part 2 (`text/x-shellscript`) runs after nodeadm completes — `xrn-install init` detects that nodeadm already ran, skips the bootstrap step, and applies only the cross-region patches (cloud-provider, hostname, providerID, topology labels, kubeconfig region), then restarts kubelet.
+> **How the parts work together:** The `application/node.eks.aws` part is consumed by nodeadm, which bootstraps kubelet with the cluster endpoint/CA. The `text/cloud-boothook` part installs a kubelet `ExecStartPre` drop-in; because `kubelet.service` is ordered `After=nodeadm-config.service`, the patch runs after the config files exist but before kubelet's main process starts. `xrn-install patch` applies the cross-region patches (cloud-provider, hostname, providerID, topology labels, kubeconfig get-token `--region`) without running nodeadm or restarting kubelet.
+>
+> **Why a boothook + `ExecStartPre`, not a one-shot `init` script?** `nodeadm-config.service` is `WantedBy=multi-user.target`, so it re-runs on **every** boot and regenerates `/etc/eks/kubelet/environment` and `/var/lib/kubelet/kubeconfig` from the NodeConfig above. A `text/x-shellscript` part runs only on first boot, so after any reboot (maintenance, stop/start, crash) nodeadm's regenerated kubeconfig would carry the node's local region again and kubelet could no longer authenticate to the home-region cluster. `ExecStartPre` runs on every kubelet start, so the patch is re-applied after each regeneration. (`xrn-install init` — discovery + nodeadm + patch + restart, run once post-boot — still exists for interactive use, but the ASG/launch-template path uses the boothook flow.)
 
 ### Step 3: Launch the instance
 

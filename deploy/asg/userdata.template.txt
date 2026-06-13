@@ -2,6 +2,52 @@ MIME-Version: 1.0
 Content-Type: multipart/mixed; boundary="//"
 
 --//
+Content-Type: text/cloud-boothook
+
+#!/bin/bash
+# Same-account / cross-region satellite bootstrap (reboot-durable, pre-kubelet ordering).
+#
+# We patch from a kubelet ExecStartPre drop-in rather than a run-once user-data shell script
+# because nodeadm-config.service is WantedBy=multi-user.target and re-runs on EVERY boot,
+# regenerating /etc/eks/kubelet/environment and /var/lib/kubelet/kubeconfig from the NodeConfig
+# below. A run-once script (text/x-shellscript) executes only on first boot, so after any reboot
+# (maintenance, stop/start, crash) nodeadm's regenerated kubeconfig would carry the node's LOCAL
+# region again and kubelet could no longer authenticate to the home-region cluster. ExecStartPre
+# runs on every kubelet start, ordered After=nodeadm-config.service, so the patch is re-applied
+# after each regeneration and survives reboots.
+#
+# cloud-boothook itself also runs on every boot; here it just (re)installs the binary and the
+# drop-in, which is idempotent.
+set -euxo pipefail
+exec > >(tee /var/log/xrn-boothook.log) 2>&1
+date
+
+CLUSTER_NAME=${CLUSTER_NAME}
+CLUSTER_REGION=${CLUSTER_REGION}
+# /latest/download/ redirects to the most recent release.
+XRN_URL="${XRN_INSTALL_URL}"
+
+# 1. Download xrn-install.
+curl -sLfo /usr/local/bin/xrn-install "$XRN_URL"
+chmod +x /usr/local/bin/xrn-install
+
+# 2. Kubelet drop-in: run the patch as ExecStartPre. kubelet.service is ordered
+#    After=nodeadm-config.service, so the config files exist by the time this runs, and
+#    kubelet's main process will not start until the patch succeeds. `patch` sets
+#    cloud-provider, hostname-override, providerID, topology labels, and rewrites the
+#    kubeconfig get-token --region to the cluster's home region. No AssumeRole helper is
+#    installed in the same-account case (the instance role can reach the cluster's EKS API).
+mkdir -p /etc/systemd/system/kubelet.service.d
+cat > /etc/systemd/system/kubelet.service.d/99-xrn-patch.conf <<DROP
+[Service]
+ExecStartPre=/usr/local/bin/xrn-install patch --cluster-name ${CLUSTER_NAME} --cluster-region ${CLUSTER_REGION}
+DROP
+
+systemctl daemon-reload
+date
+echo "xrn boothook complete"
+
+--//
 Content-Type: application/node.eks.aws
 
 ---
@@ -17,26 +63,5 @@ spec:
   kubelet:
     flags:
       - --node-labels=eks.amazonaws.com/compute-type=cross-region
-
---//
-Content-Type: text/x-shellscript
-
-#!/bin/bash
-set -euo pipefail
-
-# Download xrn-install from the public GitHub release
-# Using /latest/download/ which redirects to the most recent release
-XRN_URL="https://github.com/jicowan/eks-cross-region-nodes/releases/latest/download/xrn-install-linux-amd64"
-
-curl -sLfo /usr/local/bin/xrn-install "$XRN_URL"
-chmod +x /usr/local/bin/xrn-install
-
-# Run xrn-install. This will:
-#   - detect that nodeadm has already bootstrapped (skip nodeadm)
-#   - apply the cross-region kubelet patches (cloud-provider, hostname, providerID, labels, kubeconfig region)
-#   - restart kubelet
-/usr/local/bin/xrn-install init \
-  --cluster-name ${CLUSTER_NAME} \
-  --cluster-region ${CLUSTER_REGION}
 
 --//--
