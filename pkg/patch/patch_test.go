@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/aws/eks-cross-region-nodes/pkg/discovery"
+	"sigs.k8s.io/yaml"
 )
 
 func TestPatchKubeletEnvironment(t *testing.T) {
@@ -176,6 +177,107 @@ users:
 	}
 }
 
+// TestPatchKubeconfigAnchored proves the rewrite targets the --region arg specifically and does
+// not clobber the node's region where it legitimately appears elsewhere — in the server URL and
+// the cluster name. A first-quoted-match rewrite would corrupt those.
+func TestPatchKubeconfigAnchored(t *testing.T) {
+	tmpDir := t.TempDir()
+	kcFile := filepath.Join(tmpDir, "kubeconfig")
+
+	// The node's local region (eu-west-1) appears in the server URL BEFORE the --region arg.
+	original := `apiVersion: v1
+kind: Config
+clusters:
+  - cluster:
+      server: https://ABC123.gr7.eu-west-1.eks.amazonaws.com
+    name: cluster-eu-west-1
+users:
+  - name: kubelet
+    user:
+      exec:
+        command: aws
+        args:
+          - eks
+          - get-token
+          - --cluster-name
+          - cluster-eu-west-1
+          - --region
+          - eu-west-1
+`
+	os.WriteFile(kcFile, []byte(original), 0644)
+
+	origKcFile := kubeconfigFile
+	defer func() { setKubeconfigFile(origKcFile) }()
+	setKubeconfigFile(kcFile)
+
+	cluster := &discovery.ClusterInfo{Region: "us-east-2"}
+	node := &discovery.NodeMetadata{Region: "eu-west-1"}
+
+	if err := patchKubeconfig(cluster, node); err != nil {
+		t.Fatalf("patchKubeconfig failed: %v", err)
+	}
+
+	data, _ := os.ReadFile(kcFile)
+
+	// Re-parse and assert structurally: only the --region value changed.
+	var doc map[string]interface{}
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("result is not valid YAML: %v\n%s", err, data)
+	}
+	args, err := execArgs(doc)
+	if err != nil {
+		t.Fatalf("execArgs: %v", err)
+	}
+	// Find --region value.
+	var regionVal string
+	for i, a := range args {
+		if a == "--region" && i+1 < len(args) {
+			regionVal, _ = args[i+1].(string)
+		}
+	}
+	if regionVal != "us-east-2" {
+		t.Errorf("--region value = %q, want us-east-2", regionVal)
+	}
+
+	// The server URL and cluster name must be untouched (still reference eu-west-1).
+	clusters := doc["clusters"].([]interface{})
+	c0 := clusters[0].(map[string]interface{})
+	if c0["name"] != "cluster-eu-west-1" {
+		t.Errorf("cluster name was clobbered: %v", c0["name"])
+	}
+	server := c0["cluster"].(map[string]interface{})["server"].(string)
+	if !strings.Contains(server, "eu-west-1.eks.amazonaws.com") {
+		t.Errorf("server URL region was clobbered: %s", server)
+	}
+}
+
+// TestRewriteRegionArg covers both --region forms and the no-region case directly.
+func TestRewriteRegionArg(t *testing.T) {
+	// Separate-token form.
+	args := []interface{}{"eks", "get-token", "--region", "eu-west-1"}
+	if !rewriteRegionArg(args, "us-east-2") {
+		t.Fatal("expected rewrite to succeed")
+	}
+	if args[3] != "us-east-2" {
+		t.Errorf("args[3] = %v, want us-east-2", args[3])
+	}
+
+	// Combined --region=VALUE form.
+	args = []interface{}{"eks", "--region=eu-west-1"}
+	if !rewriteRegionArg(args, "us-east-2") {
+		t.Fatal("expected rewrite to succeed for --region= form")
+	}
+	if args[1] != "--region=us-east-2" {
+		t.Errorf("args[1] = %v, want --region=us-east-2", args[1])
+	}
+
+	// No --region present.
+	args = []interface{}{"eks", "get-token", "--cluster-name", "main"}
+	if rewriteRegionArg(args, "us-east-2") {
+		t.Error("expected no rewrite when --region is absent")
+	}
+}
+
 func TestRenderCredentialHelper(t *testing.T) {
 	s := RenderCredentialHelper("main", "us-east-2", "arn:aws:iam::820537372947:role/XrnSatelliteNodeRole", "")
 
@@ -294,6 +396,7 @@ users:
   - name: kubelet
     user:
       exec:
+        command: aws
         args:
           - "--region"
           - "eu-west-1"
@@ -343,12 +446,12 @@ users:
 		t.Errorf("ApplyAll: providerID = %v, want %s", resultConfig["providerID"], wantPID)
 	}
 
-	// Verify kubeconfig: region updated
+	// Verify kubeconfig: --region value updated to the cluster region.
 	kcContent, _ := os.ReadFile(kcFile)
-	if strings.Contains(string(kcContent), `"eu-west-1"`) {
+	if strings.Contains(string(kcContent), "eu-west-1") {
 		t.Errorf("ApplyAll: kubeconfig still has node region: %s", string(kcContent))
 	}
-	if !strings.Contains(string(kcContent), `"us-east-2"`) {
+	if !strings.Contains(string(kcContent), "us-east-2") {
 		t.Errorf("ApplyAll: kubeconfig missing cluster region: %s", string(kcContent))
 	}
 }

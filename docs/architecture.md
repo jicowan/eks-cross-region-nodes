@@ -56,7 +56,7 @@ credential path.
 | VPC CNI DaemonSet | stock `aws-node` | dedicated `aws-node-satellite-<acct>-<region>` |
 | CNI's AWS creds | Pod Identity (cluster-account role) | IMDS (satellite-account instance role) |
 | kubelet → API auth | instance role directly | instance role → AssumeRole cluster-account role |
-| Bootstrap timing | post-boot (`xrn-install init`) | pre-kubelet (`xrn-install patch` via ExecStartPre) |
+| Bootstrap timing | pre-kubelet (`xrn-install patch` via ExecStartPre) | pre-kubelet (`xrn-install patch` via ExecStartPre) |
 
 ### 3.1 Why the labels differ (DaemonSet routing)
 
@@ -146,11 +146,23 @@ access entry.
 
 ## 6. Bootstrap sequencing
 
-### 6.1 Same-account (post-boot)
+### 6.1 Same-account (pre-kubelet, ExecStartPre)
 
-User-data runs `nodeadm init` (kubelet starts), then `xrn-install init` discovers the cluster,
-applies the patches, and restarts kubelet. The brief window where kubelet ran with the default
-config is tolerated — same-account gets CCM's grace.
+A `cloud-boothook` lays down a kubelet `ExecStartPre` drop-in that runs `xrn-install patch
+--cluster-name … --cluster-region …` (no `--cluster-account-role-arn` — the instance role reaches
+the cluster's EKS API directly). The patch sets cloud-provider/hostname/providerID/labels and
+rewrites the kubeconfig get-token `--region` to the home region; no AssumeRole helper is installed.
+
+**Why ExecStartPre and not a one-shot `init` script.** `nodeadm-config.service` is
+`WantedBy=multi-user.target`, so it re-runs on **every** boot and regenerates
+`/etc/eks/kubelet/environment` and `/var/lib/kubelet/kubeconfig` from the NodeConfig. A run-once
+user-data script (`text/x-shellscript`, cloud-init per-instance) executes only on first boot, so
+after any reboot — maintenance, EC2 stop/start, crash — nodeadm's regenerated kubeconfig carries the
+node's *local* region again. Since the get-token token is a region-pinned SigV4 presigned request,
+the home-region authenticator then rejects it and kubelet can't re-authenticate. `ExecStartPre` runs
+on every kubelet start (ordered `After=nodeadm-config.service`), so the patch is re-applied after
+each regeneration and the node survives reboots. (`xrn-install init` — discovery + nodeadm + patch +
+restart — remains for interactive/manual bootstrap, but the ASG path uses the boothook flow.)
 
 ### 6.2 Cross-account (pre-kubelet, ExecStartPre-as-gate)
 

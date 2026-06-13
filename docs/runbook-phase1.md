@@ -764,6 +764,8 @@ systemctl restart kubelet
 > - The shell script patches 5 things that nodeadm gets wrong for cross-region: cloud-provider, hostname, topology labels, providerID, and kubeconfig region.
 > - The MIME boundary (`BOUNDARY`) must match exactly between header and delimiters.
 > - The `--node-labels` in the NodeConfig part sets `compute-type=cross-region`; the shell script appends the topology labels to whatever nodeadm wrote.
+>
+> **⚠ This manual fixup does NOT survive a reboot.** `text/x-shellscript` runs only on first boot, but `nodeadm-config.service` (`WantedBy=multi-user.target`) re-runs on every boot and regenerates `/etc/eks/kubelet/environment` and `/var/lib/kubelet/kubeconfig` — reverting the kubeconfig region so kubelet can no longer authenticate to the home-region cluster after a reboot/stop-start. This is fine for the throwaway Phase 1 PoC. For anything durable, use the automated flow (`deploy/asg/userdata.template.txt`), which installs a kubelet `ExecStartPre` running `xrn-install patch` so the fixup re-applies on every kubelet start. See [architecture.md §6.1](./architecture.md).
 
 ### 7.3. Launch the instance
 

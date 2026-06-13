@@ -143,17 +143,87 @@ func patchProviderID(cluster *discovery.ClusterInfo, node *discovery.NodeMetadat
 	return os.WriteFile(kubeletConfigFile, out, 0644)
 }
 
-func patchKubeconfig(cluster *discovery.ClusterInfo, node *discovery.NodeMetadata) error {
+// patchKubeconfig rewrites the region the kubelet's get-token exec plugin presigns its STS
+// token for, from the node's local region (which nodeadm fills in from IMDS) to the cluster's
+// home region. SigV4 signatures are region-pinned and the home-region EKS authenticator only
+// accepts a token presigned for its own region, so a satellite node otherwise can't authenticate.
+//
+// The rewrite is anchored to the `--region` argument specifically (not the first quoted region
+// string anywhere in the file): it parses the kubeconfig YAML, walks to the exec args list, and
+// overwrites the value following `--region`. A positional/first-match rewrite would corrupt the
+// file if the local region appeared earlier — e.g. in the cluster name or the server URL
+// (https://<id>.<region>.eks.amazonaws.com). node is unused; the target is always cluster.Region.
+func patchKubeconfig(cluster *discovery.ClusterInfo, _ *discovery.NodeMetadata) error {
 	data, err := os.ReadFile(kubeconfigFile)
 	if err != nil {
 		return fmt.Errorf("reading %s: %w", kubeconfigFile, err)
 	}
-	content := string(data)
 
-	// Replace the node's region with the cluster's region in the get-token args
-	content = strings.Replace(content, "\""+node.Region+"\"", "\""+cluster.Region+"\"", 1)
+	var doc map[string]interface{}
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return fmt.Errorf("parsing kubeconfig YAML: %w", err)
+	}
 
-	return os.WriteFile(kubeconfigFile, []byte(content), 0644)
+	args, err := execArgs(doc)
+	if err != nil {
+		return err
+	}
+	if !rewriteRegionArg(args, cluster.Region) {
+		return fmt.Errorf("no --region argument found in kubelet kubeconfig exec args")
+	}
+
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		return fmt.Errorf("marshaling kubeconfig: %w", err)
+	}
+	return os.WriteFile(kubeconfigFile, out, 0644)
+}
+
+// execArgs navigates a parsed kubeconfig to users[0].user.exec.args and returns the slice
+// (mutating its elements mutates doc, since slices are reference types).
+func execArgs(doc map[string]interface{}) ([]interface{}, error) {
+	users, ok := doc["users"].([]interface{})
+	if !ok || len(users) == 0 {
+		return nil, fmt.Errorf("kubeconfig has no users entry")
+	}
+	user0, ok := users[0].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("kubeconfig users[0] is not a mapping")
+	}
+	userBlock, ok := user0["user"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("kubeconfig users[0].user is not a mapping")
+	}
+	exec, ok := userBlock["exec"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("kubeconfig users[0].user.exec is not a mapping")
+	}
+	args, ok := exec["args"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("kubeconfig exec has no args list")
+	}
+	return args, nil
+}
+
+// rewriteRegionArg finds the `--region` entry in the exec args and sets the value that follows
+// it to region. Also handles the combined `--region=VALUE` form. Returns true if it rewrote a
+// value, false if no `--region` argument was present.
+func rewriteRegionArg(args []interface{}, region string) bool {
+	for i := 0; i < len(args); i++ {
+		s, ok := args[i].(string)
+		if !ok {
+			continue
+		}
+		if s == "--region" && i+1 < len(args) {
+			args[i+1] = region
+			return true
+		}
+		if strings.HasPrefix(s, "--region=") {
+			args[i] = "--region=" + region
+			return true
+		}
+	}
+	return false
 }
 
 // installCredentialHelper writes the AssumeRole helper script and rewrites the kubelet
