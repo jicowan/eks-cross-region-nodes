@@ -1,0 +1,21 @@
+# Terraform state
+*.tfstate
+*.tfstate.backup
+*.tfstate.*.backup
+
+# Plan files
+*.out
+tfplan.json
+
+# Provider plugins (lock file is committed for reproducibility)
+.terraform/
+!.terraform.lock.hcl
+
+# Environment-specific files
+env-discovery.json
+
+# OS files
+.DS_Store
+
+# Keep the example tfvars but ignore actual tfvars
+terraform.tfvars
