@@ -1,0 +1,15 @@
+# Copy this file to terraform.tfvars and edit values for your environment.
+
+cluster_name       = "xrn-demo"
+cluster_region     = "us-west-2"
+satellite_region   = "us-east-1"
+cluster_vpc_cidr   = "10.50.0.0/16"
+satellite_vpc_cidr = "10.60.0.0/16"
+kubernetes_version = "1.32"
+
+# Node sizing
+node_instance_type       = "m6i.large"
+local_node_instance_type = "t3.medium"
+local_node_count         = 2
+asg_desired_capacity     = 1
+asg_max_size             = 3
