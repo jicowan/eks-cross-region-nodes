@@ -37,16 +37,16 @@ type CrossAccount struct {
 
 // ProviderID format identifiers (value of --provider-id-format).
 const (
-	// ProviderIDHybrid is the default: eks-hybrid:///<region>/<cluster>/<instance-id>.
-	// Required so the EKS CCM does not reap the node (validated 2026-06-06). NOT parseable
-	// by the cluster-autoscaler AWS provider, which expects aws:///<az>/<id> — CA cannot
-	// match/autoscale nodes with this format.
-	ProviderIDHybrid = "eks-hybrid"
-	// ProviderIDAWS is the standard EC2 format: aws:///<az>/<instance-id>. Parseable by
-	// cluster-autoscaler. EXPERIMENTAL for satellite nodes: only safe if --cloud-provider=""
-	// (empty) keeps the CCM lifecycle controller from reaping the node despite the aws:/// id.
-	// See experiment/aws-providerid-ca-compat.
+	// ProviderIDAWS is the default and recommended format: aws:///<az>/<instance-id>, the
+	// standard EC2 form. Parseable by the cluster-autoscaler AWS provider (so CA can match and
+	// manage these nodes). Safe because --cloud-provider="" keeps the EKS CCM lifecycle
+	// controller from reaping the node despite the standard id — validated 2026-06-24 for both
+	// same-account (eu-west-1) and cross-account (us-west-1, separate account).
 	ProviderIDAWS = "aws"
+	// ProviderIDHybrid is the legacy format: eks-hybrid:///<region>/<cluster>/<instance-id>.
+	// Also CCM-safe, but NOT parseable by cluster-autoscaler (CA classifies the node
+	// longUnregistered and deletes it). Retained as an escape hatch; prefer ProviderIDAWS.
+	ProviderIDHybrid = "eks-hybrid"
 )
 
 // ApplyAll applies the cross-region kubelet patches. If xacct is non-nil and Enabled, it
@@ -165,15 +165,15 @@ func patchProviderID(cluster *discovery.ClusterInfo, node *discovery.NodeMetadat
 //   - ProviderIDAWS:    aws:///<availability-zone>/<instance-id>
 func RenderProviderID(format string, cluster *discovery.ClusterInfo, node *discovery.NodeMetadata) (string, error) {
 	switch format {
-	case "", ProviderIDHybrid:
-		return fmt.Sprintf("eks-hybrid:///%s/%s/%s", cluster.Region, cluster.Name, node.InstanceID), nil
-	case ProviderIDAWS:
+	case "", ProviderIDAWS:
 		if node.AvailabilityZone == "" {
 			return "", fmt.Errorf("provider-id-format=aws requires the node availability zone, which is empty")
 		}
 		return fmt.Sprintf("aws:///%s/%s", node.AvailabilityZone, node.InstanceID), nil
+	case ProviderIDHybrid:
+		return fmt.Sprintf("eks-hybrid:///%s/%s/%s", cluster.Region, cluster.Name, node.InstanceID), nil
 	default:
-		return "", fmt.Errorf("unknown provider-id-format %q (want %q or %q)", format, ProviderIDHybrid, ProviderIDAWS)
+		return "", fmt.Errorf("unknown provider-id-format %q (want %q or %q)", format, ProviderIDAWS, ProviderIDHybrid)
 	}
 }
 

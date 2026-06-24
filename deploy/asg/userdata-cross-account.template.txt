@@ -34,6 +34,11 @@ chmod +x /usr/local/bin/xrn-install
 # 2. Kubelet drop-in: run the patch as ExecStartPre. kubelet.service is ordered
 #    After=nodeadm-config.service, so the config files exist by the time this runs, and
 #    kubelet's main process will not start until the patch succeeds.
+#
+#    --provider-id-format aws writes the standard aws:///<az>/<id> providerID. With
+#    --cloud-provider="" the EKS CCM does not reap the node despite this format, validated
+#    cross-account 2026-06-24 (us-west-1, account 310444902345). This is required for a
+#    (per-account) Cluster Autoscaler to manage this ASG; eks-hybrid:/// is unparseable by CA.
 EXTERNAL_ID_ARG=""
 if [ -n "$EXTERNAL_ID" ]; then
   EXTERNAL_ID_ARG=" --cluster-account-external-id $EXTERNAL_ID"
@@ -41,7 +46,7 @@ fi
 mkdir -p /etc/systemd/system/kubelet.service.d
 cat > /etc/systemd/system/kubelet.service.d/99-xrn-patch.conf <<DROP
 [Service]
-ExecStartPre=/usr/local/bin/xrn-install patch --cluster-name ${CLUSTER_NAME} --cluster-region ${CLUSTER_REGION} --cluster-account-role-arn ${SATELLITE_ROLE_ARN}${EXTERNAL_ID_ARG}
+ExecStartPre=/usr/local/bin/xrn-install patch --cluster-name ${CLUSTER_NAME} --cluster-region ${CLUSTER_REGION} --cluster-account-role-arn ${SATELLITE_ROLE_ARN}${EXTERNAL_ID_ARG} --provider-id-format aws
 DROP
 
 systemctl daemon-reload

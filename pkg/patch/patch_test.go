@@ -137,27 +137,27 @@ func TestRenderProviderID(t *testing.T) {
 	cluster := &discovery.ClusterInfo{Region: "us-east-2", Name: "main"}
 	node := &discovery.NodeMetadata{InstanceID: "i-0abc", AvailabilityZone: "eu-west-1b"}
 
-	// Default and explicit hybrid.
-	for _, f := range []string{"", ProviderIDHybrid} {
+	// Default ("") and explicit aws both render the aws:/// form (AZ + instance id).
+	for _, f := range []string{"", ProviderIDAWS} {
 		got, err := RenderProviderID(f, cluster, node)
 		if err != nil {
 			t.Fatalf("format %q: %v", f, err)
 		}
-		if want := "eks-hybrid:///us-east-2/main/i-0abc"; got != want {
+		if want := "aws:///eu-west-1b/i-0abc"; got != want {
 			t.Errorf("format %q: got %q, want %q", f, got, want)
 		}
 	}
 
-	// aws form uses AZ + instance id, no cluster name/region.
-	got, err := RenderProviderID(ProviderIDAWS, cluster, node)
+	// Explicit hybrid renders the eks-hybrid:/// form (region/cluster/id).
+	got, err := RenderProviderID(ProviderIDHybrid, cluster, node)
 	if err != nil {
-		t.Fatalf("aws format: %v", err)
+		t.Fatalf("hybrid format: %v", err)
 	}
-	if want := "aws:///eu-west-1b/i-0abc"; got != want {
-		t.Errorf("aws format: got %q, want %q", got, want)
+	if want := "eks-hybrid:///us-east-2/main/i-0abc"; got != want {
+		t.Errorf("hybrid format: got %q, want %q", got, want)
 	}
 
-	// aws form requires an AZ.
+	// aws form (the default) requires an AZ.
 	if _, err := RenderProviderID(ProviderIDAWS, cluster, &discovery.NodeMetadata{InstanceID: "i-0abc"}); err == nil {
 		t.Error("aws format with empty AZ should error")
 	}

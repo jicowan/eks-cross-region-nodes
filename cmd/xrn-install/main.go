@@ -68,11 +68,12 @@ Cross-account:
   --cluster-account-external-id is optional (sts:ExternalId on the AssumeRole).
 
 providerID format:
-  --provider-id-format eks-hybrid (default) writes providerID=eks-hybrid:///<region>/<cluster>/<id>,
-  which prevents the EKS CCM from reaping the node but is NOT understood by the cluster-autoscaler
-  AWS provider (CA can't match/autoscale these nodes). --provider-id-format aws writes the standard
-  aws:///<az>/<id>, which CA understands; EXPERIMENTAL — only safe if --cloud-provider="" keeps the
-  CCM from deleting the node. See experiment/aws-providerid-ca-compat.
+  --provider-id-format aws (default) writes providerID=aws:///<az>/<id>, the standard EC2 form. It is
+  CCM-safe (with --cloud-provider="" the CCM does not reap the node — validated same- and
+  cross-account) AND parseable by the cluster-autoscaler AWS provider, so CA can manage these nodes.
+  --provider-id-format eks-hybrid writes eks-hybrid:///<region>/<cluster>/<id> (legacy escape hatch);
+  also CCM-safe but NOT parseable by cluster-autoscaler, which will delete the node as
+  longUnregistered.
 `)
 }
 

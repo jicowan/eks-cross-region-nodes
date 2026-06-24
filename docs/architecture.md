@@ -106,25 +106,37 @@ node, but with the right providerID set in time it does not act on it. This is w
 the pre-kubelet ordering (§6.2): cross-account gets no grace window, so a post-boot patch races the
 reaper.
 
-### providerID format: `aws:///` (same-account) vs `eks-hybrid:///` (cross-account)
+### providerID format: `aws:///` for both topologies
 
-The providerID format is chosen by `xrn-install --provider-id-format` (`aws` or `eks-hybrid`):
+`xrn-install --provider-id-format` selects the providerID (`aws` default, or `eks-hybrid` legacy).
+**Both topologies use `aws:///<az>/<instance-id>`.**
 
 | | Same-account / cross-region | Cross-account |
 |---|---|---|
-| providerID | `aws:///<az>/<instance-id>` | `eks-hybrid:///<region>/<cluster>/<id>` |
-| CCM reaps it? | No — **with `--cloud-provider=""`** the lifecycle controller does not delete it (validated 2026-06-24) | No — the hybrid providerID is not reaped |
-| Cluster Autoscaler can manage it? | **Yes** — CA's AWS provider parses `aws:///<az>/<id>` and matches it to the ASG instance | **No** — CA can't parse `eks-hybrid:///`, classifies the node `longUnregistered`, and deletes it on a ~15min loop |
+| providerID | `aws:///<az>/<instance-id>` | `aws:///<az>/<instance-id>` |
+| CCM reaps it? | No — **with `--cloud-provider=""`** the lifecycle controller does not delete it | No — same (validated 2026-06-24, us-west-1 / account 310444902345) |
+| Cluster Autoscaler can match it? | Yes — CA parses `aws:///<az>/<id>` | Yes — same format |
+| Cluster Autoscaler can manage the ASG? | **Yes** — the cluster's CA already has eu-west-1 reach with cluster-account creds | **Only with a per-account CA** — see below |
 
-**Why the split.** Originally both topologies used `eks-hybrid:///`, because that's what the CCM
-lifecycle controller demonstrably does not reap. But that format is unparseable by the
+**What actually prevents CCM reaping is `--cloud-provider=""`, not the providerID prefix.** Originally
+both topologies used `eks-hybrid:///` on the assumption that the prefix was what stopped the CCM
+lifecycle controller from deleting the node. But `eks-hybrid:///` is unparseable by the
 Cluster Autoscaler AWS provider (`AwsRefFromProviderId` requires `aws:///<zone>/<name>`), so CA
-churned the satellite ASGs. The 2026-06-24 test showed that for **same-account** nodes the
-`eks-hybrid:///` providerID was never actually necessary — what prevents reaping is
-`--cloud-provider=""`, not the providerID prefix. So same-account uses `aws:///` (CCM-safe **and**
-CA-manageable). Cross-account still uses `eks-hybrid:///`: the CCM is more aggressive across accounts
-and `aws:///` there is unverified, so cross-account ASGs are **not** autoscaled by CA (run them
-static or with an ASG-native policy). See [`deploy/cluster-autoscaler/README.md`](../deploy/cluster-autoscaler/README.md).
+churned the satellite ASGs as `longUnregistered`. Testing on 2026-06-24 showed the prefix was never
+necessary: a node with `aws:///` + `--cloud-provider=""` is **not** reaped by the CCM in either the
+same-account (eu-west-1) or cross-account (us-west-1, different account) case. So both topologies now
+use `aws:///`, which is CCM-safe and CA-parseable.
+
+**Autoscaling the cross-account ASG needs a second CA deployment.** The providerID format is no
+longer the blocker — that's solved identically to same-account. The remaining constraint is that
+Cluster Autoscaler's AWS provider is single-account / single-region per process: one CA uses one set
+of credentials and one `AWS_REGION`. The cluster's CA runs with cluster-account creds and (e.g.)
+`AWS_REGION=eu-west-1`, so it cannot enumerate or scale an ASG in account 310444902345 / us-west-1.
+To autoscale a cross-account ASG, run a **separate CA deployment** scoped to that account:
+`AWS_REGION=<satellite-region>`, `--nodes=0:N:<satellite-asg>`, and credentials for the satellite
+account (Pod Identity with `targetRoleArn` chaining into a role in the satellite account that holds
+the autoscaling/EC2 permissions, or equivalent). See
+[`deploy/cluster-autoscaler/README.md`](../deploy/cluster-autoscaler/README.md).
 
 ## 5. Credential chains
 

@@ -252,16 +252,23 @@ nodes, not autoscale them.
 **Fix (no CA fork):** `xrn-install` gained `--provider-id-format {eks-hybrid|aws}` (default
 `eks-hybrid`; pure `RenderProviderID`). Same-account userdata now passes `--provider-id-format aws`.
 
-**Validated end-to-end (2026-06-24, same-account / cross-region):**
-- A node with `aws:///<az>/<id>` + `--cloud-provider=""` ran ~45 min under an active CA with **no
-  reap** — so `eks-hybrid:///` was never required to avoid reaping; `--cloud-provider=""` is what
-  prevents it. The earlier 30s deletions were tied to `--cloud-provider=external`.
-- CA issued `TriggeredScaleUp [{cross-region-main-asg 0->3}]` for Pending pods, the ASG scaled to 3,
-  new `aws:///` nodes joined, pods scheduled. Scale-up + no-false-reap both confirmed.
-- **Caveat:** validated same-account only. Cross-account stays on `eks-hybrid:///` (CCM more
-  aggressive across accounts, `aws:///` there unverified) → the AWS CA cannot manage cross-account
-  ASGs; run them static or ASG-native. Operational note: a long-running CA pod cached a stale ASG
-  model from the prior hybrid churn; a CA restart was needed before it scaled the `aws:///` nodes.
+**Validated end-to-end (2026-06-24):**
+- *Same-account (eu-west-1):* a node with `aws:///<az>/<id>` + `--cloud-provider=""` ran ~45 min
+  under an active CA with **no reap**, and CA issued `TriggeredScaleUp [{cross-region-main-asg 0->3}]`
+  → ASG scaled to 3, new `aws:///` nodes joined, pods scheduled. Scale-up + no-false-reap confirmed.
+- *Cross-account (us-west-1, account 310444902345):* a node launched with `aws:///` +
+  `--cloud-provider=""` joined and stayed Ready >10 min with **no `DeletingNode`**; its satellite
+  `aws-node` DS pod went 2/2 (IMDS creds). So `aws:///` is CCM-safe cross-account too — the
+  `eks-hybrid:///` prefix was never what prevented reaping; **`--cloud-provider=""` is.** The earlier
+  30s deletions were tied to `--cloud-provider=external`.
+- **Conclusion:** both topologies use `aws:///`. providerID is no longer a CA blocker in either case.
+- **Remaining cross-account constraint (not a providerID issue):** CA's AWS provider is
+  single-account/single-region per process, so the cluster's CA can't reach an ASG in another
+  account. Autoscaling a cross-account ASG requires a **second CA deployment** scoped to the
+  satellite account (`AWS_REGION=<sat-region>`, `--nodes`, satellite-account creds via Pod Identity
+  `targetRoleArn`). Not yet built/tested.
+- *Operational note:* a long-running CA pod cached a stale ASG model from the prior hybrid churn; a
+  CA restart was needed before it scaled the `aws:///` nodes.
 
 ## 6. Non-gaps (things the PRDs call for that ARE done)
 
