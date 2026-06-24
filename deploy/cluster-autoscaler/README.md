@@ -14,6 +14,24 @@ Throughout this doc, replace these placeholders with your values:
 | `<satellite-asg-name>` | the satellite ASG (e.g. `cross-region-<cluster>-asg`) |
 | `<satellite-vpc-cidr>` | the satellite VPC CIDR |
 
+## ⚠ Required: satellite nodes must use the `aws:///` providerID
+
+Cluster Autoscaler's AWS provider matches an ASG instance to its Kubernetes `Node` by **exact
+`providerID` string equality**, and it only parses the standard `aws:///<az>/<instance-id>` form
+(hard-coded regex; there is no config to teach it another format). A node whose providerID is
+`eks-hybrid:///<region>/<cluster>/<id>` never matches its ASG instance, so CA classifies it as
+`longUnregistered` and **deletes it after ~15 minutes** — a launch→reap→relaunch churn loop, with
+no autoscaling.
+
+For **same-account / cross-region** satellites, `xrn-install patch --provider-id-format aws` writes
+the `aws:///` form (this is the default in `deploy/asg/userdata.template.txt`). Combined with
+`--cloud-provider=""`, the EKS CCM does **not** reap the node despite the standard providerID
+(validated 2026-06-24). CA then matches and scales these nodes normally.
+
+**Cross-account satellites still require `eks-hybrid:///`** (the CCM is more aggressive across
+accounts), so the AWS Cluster Autoscaler **cannot manage cross-account ASGs** — run those at a fixed
+size or scale them with an ASG-native policy. See `docs/architecture.md`.
+
 ## Why explicit ASG list (not auto-discovery)
 
 CA supports two modes:

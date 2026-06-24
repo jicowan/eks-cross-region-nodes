@@ -180,20 +180,34 @@ Runs on the node (in user-data). Subcommands:
 | `discover` | print discovered cluster config as JSON; applies nothing. |
 
 Flags: `--cluster-name`, `--cluster-region` (required); `--cluster-account-role-arn` and
-`--cluster-account-external-id` (cross-account).
+`--cluster-account-external-id` (cross-account); `--provider-id-format {eks-hybrid|aws}`
+(default `eks-hybrid`).
 
-### Same-account / cross-region (post-boot `init`)
+### Same-account / cross-region (pre-kubelet `patch`, `--provider-id-format aws`)
 
 User-data (AL2023 MIME multipart) sets the `cross-region` label via NodeConfig, then a
-shell part runs `init`:
+`cloud-boothook` installs a kubelet `ExecStartPre` drop-in that runs `patch` before kubelet's
+first (and every) start:
 ```bash
 curl -sLfo /usr/local/bin/xrn-install "$XRN_URL" && chmod +x /usr/local/bin/xrn-install
-/usr/local/bin/xrn-install init --cluster-name main --cluster-region us-east-2
+mkdir -p /etc/systemd/system/kubelet.service.d
+cat > /etc/systemd/system/kubelet.service.d/99-xrn-patch.conf <<DROP
+[Service]
+ExecStartPre=/usr/local/bin/xrn-install patch --cluster-name main --cluster-region us-east-2 --provider-id-format aws
+DROP
+systemctl daemon-reload
 ```
-`init` runs after kubelet has started; it patches the providerID/hostname/labels/kubeconfig and
-restarts kubelet. The brief window before the patch is tolerated in the same-account case.
+The `ExecStartPre` flow (not a run-once `init`) makes the patch reboot-durable — `nodeadm-config`
+regenerates the kubelet config on every boot, and `ExecStartPre` re-applies the patch each time.
 
-Template: `deploy/asg/userdata.template.txt`.
+`--provider-id-format aws` writes the standard `aws:///<az>/<id>` providerID. This is required for
+**Cluster Autoscaler** to manage these nodes (CA only understands `aws:///`; with `eks-hybrid:///`
+it deletes them as `longUnregistered`). With `--cloud-provider=""` the EKS CCM does not reap the
+node despite the `aws:///` providerID. (Cross-account uses `eks-hybrid:///` — see below — and so
+cannot be autoscaled by CA.)
+
+Template: `deploy/asg/userdata.template.txt`. (`init` — discovery + nodeadm + patch + restart, run
+once post-boot — still exists for interactive/manual bootstrap.)
 
 ### Cross-account (pre-kubelet `patch`)
 
