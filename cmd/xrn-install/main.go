@@ -45,7 +45,8 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, `xrn-install — Cross-region EKS node installer
 
 Usage:
-  xrn-install init       --cluster-name NAME --cluster-region REGION [--cluster-account-role-arn ARN] [--cluster-account-external-id ID]
+  xrn-install init       --cluster-name NAME --cluster-region REGION [--cluster-account-role-arn ARN] [--cluster-account-external-id ID] [--provider-id-format eks-hybrid|aws]
+  xrn-install patch      --cluster-name NAME --cluster-region REGION [--cluster-account-role-arn ARN] [--cluster-account-external-id ID] [--provider-id-format eks-hybrid|aws]
   xrn-install preflight  --cluster-name NAME --cluster-region REGION
   xrn-install discover   --cluster-name NAME --cluster-region REGION
   xrn-install version
@@ -65,6 +66,13 @@ Cross-account:
   kubelet credentials (e.g. arn:aws:iam::<cluster-acct>:role/XrnSatelliteNodeRole). The
   installer auto-detects the account mismatch and errors with a hint if the flag is missing.
   --cluster-account-external-id is optional (sts:ExternalId on the AssumeRole).
+
+providerID format:
+  --provider-id-format eks-hybrid (default) writes providerID=eks-hybrid:///<region>/<cluster>/<id>,
+  which prevents the EKS CCM from reaping the node but is NOT understood by the cluster-autoscaler
+  AWS provider (CA can't match/autoscale these nodes). --provider-id-format aws writes the standard
+  aws:///<az>/<id>, which CA understands; EXPERIMENTAL — only safe if --cloud-provider="" keeps the
+  CCM from deleting the node. See experiment/aws-providerid-ca-compat.
 `)
 }
 
@@ -133,7 +141,7 @@ func runInit(ctx context.Context) int {
 	} else {
 		fmt.Println("  Patching kubelet configuration for cross-region...")
 	}
-	if err := patch.ApplyAll(ctx, cluster, node, xacct); err != nil {
+	if err := patch.ApplyAll(ctx, cluster, node, xacct, cfg.ProviderIDFormat); err != nil {
 		fmt.Fprintf(os.Stderr, "error: patch failed: %v\n", err)
 		return 1
 	}
@@ -178,7 +186,7 @@ func runPatch(ctx context.Context) int {
 		return 14
 	}
 
-	if err := patch.ApplyAll(ctx, cluster, node, xacct); err != nil {
+	if err := patch.ApplyAll(ctx, cluster, node, xacct, cfg.ProviderIDFormat); err != nil {
 		fmt.Fprintf(os.Stderr, "error: patch failed: %v\n", err)
 		return 1
 	}
@@ -256,6 +264,7 @@ type config struct {
 	ClusterRegion         string
 	ClusterAccountRoleARN string // cross-account: role in the cluster account the instance assumes
 	ClusterAccountExtID   string // optional sts:ExternalId for the AssumeRole
+	ProviderIDFormat      string // "eks-hybrid" (default) or "aws"; see pkg/patch ProviderID* consts
 }
 
 func parseFlags() (*config, error) {
@@ -288,6 +297,12 @@ func parseFlags() (*config, error) {
 			}
 			i++
 			cfg.ClusterAccountExtID = args[i]
+		case "--provider-id-format":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("--provider-id-format requires a value")
+			}
+			i++
+			cfg.ProviderIDFormat = args[i]
 		default:
 			return nil, fmt.Errorf("unknown flag: %s", args[i])
 		}
@@ -298,6 +313,12 @@ func parseFlags() (*config, error) {
 	}
 	if cfg.ClusterRegion == "" {
 		return nil, fmt.Errorf("--cluster-region is required")
+	}
+	switch cfg.ProviderIDFormat {
+	case "", patch.ProviderIDHybrid, patch.ProviderIDAWS:
+		// ok
+	default:
+		return nil, fmt.Errorf("--provider-id-format must be %q or %q, got %q", patch.ProviderIDHybrid, patch.ProviderIDAWS, cfg.ProviderIDFormat)
 	}
 	return cfg, nil
 }

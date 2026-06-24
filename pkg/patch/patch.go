@@ -35,14 +35,29 @@ type CrossAccount struct {
 	ExternalID       string // optional sts:ExternalId
 }
 
+// ProviderID format identifiers (value of --provider-id-format).
+const (
+	// ProviderIDHybrid is the default: eks-hybrid:///<region>/<cluster>/<instance-id>.
+	// Required so the EKS CCM does not reap the node (validated 2026-06-06). NOT parseable
+	// by the cluster-autoscaler AWS provider, which expects aws:///<az>/<id> — CA cannot
+	// match/autoscale nodes with this format.
+	ProviderIDHybrid = "eks-hybrid"
+	// ProviderIDAWS is the standard EC2 format: aws:///<az>/<instance-id>. Parseable by
+	// cluster-autoscaler. EXPERIMENTAL for satellite nodes: only safe if --cloud-provider=""
+	// (empty) keeps the CCM lifecycle controller from reaping the node despite the aws:/// id.
+	// See experiment/aws-providerid-ca-compat.
+	ProviderIDAWS = "aws"
+)
+
 // ApplyAll applies the cross-region kubelet patches. If xacct is non-nil and Enabled, it
 // installs the AssumeRole credential helper and points the kubeconfig at it; otherwise it
-// applies the same-account region rewrite (unchanged behavior).
-func ApplyAll(ctx context.Context, cluster *discovery.ClusterInfo, node *discovery.NodeMetadata, xacct *CrossAccount) error {
+// applies the same-account region rewrite (unchanged behavior). providerIDFormat selects the
+// providerID written to the kubelet config (ProviderIDHybrid default, or ProviderIDAWS).
+func ApplyAll(ctx context.Context, cluster *discovery.ClusterInfo, node *discovery.NodeMetadata, xacct *CrossAccount, providerIDFormat string) error {
 	if err := patchKubeletEnvironment(cluster, node); err != nil {
 		return fmt.Errorf("patching kubelet environment: %w", err)
 	}
-	if err := patchProviderID(cluster, node); err != nil {
+	if err := patchProviderID(cluster, node, providerIDFormat); err != nil {
 		return fmt.Errorf("patching providerID: %w", err)
 	}
 	if xacct != nil && xacct.Enabled {
@@ -120,7 +135,7 @@ func patchKubeletEnvironment(cluster *discovery.ClusterInfo, node *discovery.Nod
 	return os.WriteFile(kubeletEnvFile, []byte(content), 0644)
 }
 
-func patchProviderID(cluster *discovery.ClusterInfo, node *discovery.NodeMetadata) error {
+func patchProviderID(cluster *discovery.ClusterInfo, node *discovery.NodeMetadata, format string) error {
 	data, err := os.ReadFile(kubeletConfigFile)
 	if err != nil {
 		return fmt.Errorf("reading %s: %w", kubeletConfigFile, err)
@@ -131,9 +146,11 @@ func patchProviderID(cluster *discovery.ClusterInfo, node *discovery.NodeMetadat
 		return fmt.Errorf("parsing kubelet config JSON: %w", err)
 	}
 
-	// Set providerID to eks-hybrid format
-	hybridProviderID := fmt.Sprintf("eks-hybrid:///%s/%s/%s", cluster.Region, cluster.Name, node.InstanceID)
-	config["providerID"] = hybridProviderID
+	providerID, err := RenderProviderID(format, cluster, node)
+	if err != nil {
+		return err
+	}
+	config["providerID"] = providerID
 
 	out, err := json.MarshalIndent(config, "", "    ")
 	if err != nil {
@@ -141,6 +158,23 @@ func patchProviderID(cluster *discovery.ClusterInfo, node *discovery.NodeMetadat
 	}
 
 	return os.WriteFile(kubeletConfigFile, out, 0644)
+}
+
+// RenderProviderID builds the providerID string for the given format. Pure function.
+//   - ProviderIDHybrid: eks-hybrid:///<cluster-region>/<cluster-name>/<instance-id>
+//   - ProviderIDAWS:    aws:///<availability-zone>/<instance-id>
+func RenderProviderID(format string, cluster *discovery.ClusterInfo, node *discovery.NodeMetadata) (string, error) {
+	switch format {
+	case "", ProviderIDHybrid:
+		return fmt.Sprintf("eks-hybrid:///%s/%s/%s", cluster.Region, cluster.Name, node.InstanceID), nil
+	case ProviderIDAWS:
+		if node.AvailabilityZone == "" {
+			return "", fmt.Errorf("provider-id-format=aws requires the node availability zone, which is empty")
+		}
+		return fmt.Sprintf("aws:///%s/%s", node.AvailabilityZone, node.InstanceID), nil
+	default:
+		return "", fmt.Errorf("unknown provider-id-format %q (want %q or %q)", format, ProviderIDHybrid, ProviderIDAWS)
+	}
 }
 
 // patchKubeconfig rewrites the region the kubelet's get-token exec plugin presigns its STS

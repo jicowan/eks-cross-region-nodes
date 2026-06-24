@@ -118,7 +118,7 @@ func TestPatchProviderID(t *testing.T) {
 	cluster := &discovery.ClusterInfo{Region: "us-east-2", Name: "main"}
 	node := &discovery.NodeMetadata{InstanceID: "i-0a5ecec7f33053b35"}
 
-	err := patchProviderID(cluster, node)
+	err := patchProviderID(cluster, node, ProviderIDHybrid)
 	if err != nil {
 		t.Fatalf("patchProviderID failed: %v", err)
 	}
@@ -130,6 +130,41 @@ func TestPatchProviderID(t *testing.T) {
 	expected := "eks-hybrid:///us-east-2/main/i-0a5ecec7f33053b35"
 	if result["providerID"] != expected {
 		t.Errorf("providerID = %v, want %s", result["providerID"], expected)
+	}
+}
+
+func TestRenderProviderID(t *testing.T) {
+	cluster := &discovery.ClusterInfo{Region: "us-east-2", Name: "main"}
+	node := &discovery.NodeMetadata{InstanceID: "i-0abc", AvailabilityZone: "eu-west-1b"}
+
+	// Default and explicit hybrid.
+	for _, f := range []string{"", ProviderIDHybrid} {
+		got, err := RenderProviderID(f, cluster, node)
+		if err != nil {
+			t.Fatalf("format %q: %v", f, err)
+		}
+		if want := "eks-hybrid:///us-east-2/main/i-0abc"; got != want {
+			t.Errorf("format %q: got %q, want %q", f, got, want)
+		}
+	}
+
+	// aws form uses AZ + instance id, no cluster name/region.
+	got, err := RenderProviderID(ProviderIDAWS, cluster, node)
+	if err != nil {
+		t.Fatalf("aws format: %v", err)
+	}
+	if want := "aws:///eu-west-1b/i-0abc"; got != want {
+		t.Errorf("aws format: got %q, want %q", got, want)
+	}
+
+	// aws form requires an AZ.
+	if _, err := RenderProviderID(ProviderIDAWS, cluster, &discovery.NodeMetadata{InstanceID: "i-0abc"}); err == nil {
+		t.Error("aws format with empty AZ should error")
+	}
+
+	// unknown format errors.
+	if _, err := RenderProviderID("bogus", cluster, node); err == nil {
+		t.Error("unknown format should error")
 	}
 }
 
@@ -420,7 +455,7 @@ users:
 		AvailabilityZone: "eu-west-1b",
 	}
 
-	if err := ApplyAll(context.Background(), cluster, node, nil); err != nil {
+	if err := ApplyAll(context.Background(), cluster, node, nil, ProviderIDHybrid); err != nil {
 		t.Fatalf("ApplyAll failed: %v", err)
 	}
 
