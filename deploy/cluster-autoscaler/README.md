@@ -14,6 +14,28 @@ Throughout this doc, replace these placeholders with your values:
 | `<satellite-asg-name>` | the satellite ASG (e.g. `cross-region-<cluster>-asg`) |
 | `<satellite-vpc-cidr>` | the satellite VPC CIDR |
 
+## ⚠ Required: satellite nodes must use the `aws:///` providerID
+
+Cluster Autoscaler's AWS provider matches an ASG instance to its Kubernetes `Node` by **exact
+`providerID` string equality**, and it only parses the standard `aws:///<az>/<instance-id>` form
+(hard-coded regex; there is no config to teach it another format). A node whose providerID is
+`eks-hybrid:///<region>/<cluster>/<id>` never matches its ASG instance, so CA classifies it as
+`longUnregistered` and **deletes it after ~15 minutes** — a launch→reap→relaunch churn loop, with
+no autoscaling.
+
+`xrn-install patch --provider-id-format aws` writes the `aws:///` form (the default in both
+`deploy/asg/userdata.template.txt` and the cross-account template). Combined with
+`--cloud-provider=""`, the EKS CCM does **not** reap the node despite the standard providerID —
+validated 2026-06-24 for **both** same-account (eu-west-1) and cross-account (us-west-1, account
+310444902345). CA can then match these nodes in either topology.
+
+**Cross-account ASGs need a separate CA deployment.** The providerID is no longer the blocker, but
+CA's AWS provider is single-account/single-region per process: the cluster's CA (cluster-account
+creds, cluster region's view) cannot enumerate or scale an ASG in another account. To autoscale a
+cross-account ASG, run a **second CA** scoped to the satellite account — `AWS_REGION=<satellite-region>`,
+`--nodes=0:N:<satellite-asg>`, and credentials for that account (Pod Identity with `targetRoleArn`
+chaining into a satellite-account role with the autoscaling/EC2 permissions). See `docs/architecture.md`.
+
 ## Why explicit ASG list (not auto-discovery)
 
 CA supports two modes:

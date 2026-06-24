@@ -27,9 +27,9 @@ same-account/cross-region path), `patch` (patch only, no nodeadm/restart — run
 2. Discover node metadata from IMDS
 3. (`init`) run pre-flight checks; (`init`) invoke `nodeadm init`
 4. Patch kubelet for cross-region operation:
-   - `--cloud-provider=""` (prevents CCM from deleting the node)
+   - `--cloud-provider=""` (this — not the providerID format — is what prevents the CCM from deleting the node)
    - `--hostname-override=<instance-id>` (matches HYBRID_LINUX identity)
-   - `providerID=eks-hybrid:///<cluster-region>/<cluster-name>/<instance-id>`
+   - `providerID=aws:///<az>/<instance-id>` by default (CCM-safe and parseable by Cluster Autoscaler; `--provider-id-format eks-hybrid` for the legacy `eks-hybrid:///` form)
    - Topology labels via `--node-labels`
    - Kubeconfig: cluster region for STS (same-account), **or** an AssumeRole credential helper (cross-account, via `--cluster-account-role-arn`)
 5. (`init`) restart kubelet

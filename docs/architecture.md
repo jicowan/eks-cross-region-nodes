@@ -96,16 +96,47 @@ A satellite instance is invisible to both (wrong region, and for cross-account, 
 defenses, applied by `xrn-install`:
 
 1. `--cloud-provider=""` (not `external`) — disables CCM integration on the kubelet side.
-2. `providerID=eks-hybrid:///<cluster-region>/<cluster>/<instance-id>` — the hybrid providerID the
-   lifecycle controller does not reap.
+2. `providerID` — see the format decision below.
 3. `--hostname-override=<instance-id>` — so the node name matches the `system:node:<id>` identity.
 4. Topology labels (`topology.kubernetes.io/region`/`zone`).
 
-**The decisive factor (validated 2026-06-06):** the `eks-hybrid:///` providerID must be in place
+**The decisive factor for cross-account (validated 2026-06-06):** the providerID must be in place
 **before kubelet's first registration**. CCM continues to log `DescribeInstances`/`NotFound` for the
-node, but with the hybrid providerID set in time it does not act on it. This is why cross-account
-uses the pre-kubelet ordering (§6.2): cross-account gets no grace window, so a post-boot patch races
-the reaper.
+node, but with the right providerID set in time it does not act on it. This is why cross-account uses
+the pre-kubelet ordering (§6.2): cross-account gets no grace window, so a post-boot patch races the
+reaper.
+
+### providerID format: `aws:///` for both topologies
+
+`xrn-install --provider-id-format` selects the providerID (`aws` default, or `eks-hybrid` legacy).
+**Both topologies use `aws:///<az>/<instance-id>`.**
+
+| | Same-account / cross-region | Cross-account |
+|---|---|---|
+| providerID | `aws:///<az>/<instance-id>` | `aws:///<az>/<instance-id>` |
+| CCM reaps it? | No — **with `--cloud-provider=""`** the lifecycle controller does not delete it | No — same (validated 2026-06-24, us-west-1 / account 310444902345) |
+| Cluster Autoscaler can match it? | Yes — CA parses `aws:///<az>/<id>` | Yes — same format |
+| Cluster Autoscaler can manage the ASG? | **Yes** — the cluster's CA already has eu-west-1 reach with cluster-account creds | **Only with a per-account CA** — see below |
+
+**What actually prevents CCM reaping is `--cloud-provider=""`, not the providerID prefix.** Originally
+both topologies used `eks-hybrid:///` on the assumption that the prefix was what stopped the CCM
+lifecycle controller from deleting the node. But `eks-hybrid:///` is unparseable by the
+Cluster Autoscaler AWS provider (`AwsRefFromProviderId` requires `aws:///<zone>/<name>`), so CA
+churned the satellite ASGs as `longUnregistered`. Testing on 2026-06-24 showed the prefix was never
+necessary: a node with `aws:///` + `--cloud-provider=""` is **not** reaped by the CCM in either the
+same-account (eu-west-1) or cross-account (us-west-1, different account) case. So both topologies now
+use `aws:///`, which is CCM-safe and CA-parseable.
+
+**Autoscaling the cross-account ASG needs a second CA deployment.** The providerID format is no
+longer the blocker — that's solved identically to same-account. The remaining constraint is that
+Cluster Autoscaler's AWS provider is single-account / single-region per process: one CA uses one set
+of credentials and one `AWS_REGION`. The cluster's CA runs with cluster-account creds and (e.g.)
+`AWS_REGION=eu-west-1`, so it cannot enumerate or scale an ASG in account 310444902345 / us-west-1.
+To autoscale a cross-account ASG, run a **separate CA deployment** scoped to that account:
+`AWS_REGION=<satellite-region>`, `--nodes=0:N:<satellite-asg>`, and credentials for the satellite
+account (Pod Identity with `targetRoleArn` chaining into a role in the satellite account that holds
+the autoscaling/EC2 permissions, or equivalent). See
+[`deploy/cluster-autoscaler/README.md`](../deploy/cluster-autoscaler/README.md).
 
 ## 5. Credential chains
 

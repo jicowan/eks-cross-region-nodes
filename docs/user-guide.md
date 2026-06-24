@@ -180,24 +180,37 @@ Runs on the node (in user-data). Subcommands:
 | `discover` | print discovered cluster config as JSON; applies nothing. |
 
 Flags: `--cluster-name`, `--cluster-region` (required); `--cluster-account-role-arn` and
-`--cluster-account-external-id` (cross-account).
+`--cluster-account-external-id` (cross-account); `--provider-id-format {eks-hybrid|aws}`
+(default `eks-hybrid`).
 
-### Same-account / cross-region (post-boot `init`)
+### Same-account / cross-region (pre-kubelet `patch`, `--provider-id-format aws`)
 
 User-data (AL2023 MIME multipart) sets the `cross-region` label via NodeConfig, then a
-shell part runs `init`:
+`cloud-boothook` installs a kubelet `ExecStartPre` drop-in that runs `patch` before kubelet's
+first (and every) start:
 ```bash
 curl -sLfo /usr/local/bin/xrn-install "$XRN_URL" && chmod +x /usr/local/bin/xrn-install
-/usr/local/bin/xrn-install init --cluster-name main --cluster-region us-east-2
+mkdir -p /etc/systemd/system/kubelet.service.d
+cat > /etc/systemd/system/kubelet.service.d/99-xrn-patch.conf <<DROP
+[Service]
+ExecStartPre=/usr/local/bin/xrn-install patch --cluster-name main --cluster-region us-east-2 --provider-id-format aws
+DROP
+systemctl daemon-reload
 ```
-`init` runs after kubelet has started; it patches the providerID/hostname/labels/kubeconfig and
-restarts kubelet. The brief window before the patch is tolerated in the same-account case.
+The `ExecStartPre` flow (not a run-once `init`) makes the patch reboot-durable — `nodeadm-config`
+regenerates the kubelet config on every boot, and `ExecStartPre` re-applies the patch each time.
 
-Template: `deploy/asg/userdata.template.txt`.
+`--provider-id-format aws` (the default) writes the standard `aws:///<az>/<id>` providerID. This is
+required for **Cluster Autoscaler** to manage these nodes (CA only understands `aws:///`; with
+`eks-hybrid:///` it deletes them as `longUnregistered`). With `--cloud-provider=""` the EKS CCM does
+not reap the node despite the `aws:///` providerID — true for cross-account too (see below).
+
+Template: `deploy/asg/userdata.template.txt`. (`init` — discovery + nodeadm + patch + restart, run
+once post-boot — still exists for interactive/manual bootstrap.)
 
 ### Cross-account (pre-kubelet `patch`)
 
-A cross-account node must have the `eks-hybrid:///` providerID in place **before** kubelet first
+A cross-account node must have its providerID and config in place **before** kubelet first
 registers (it gets no CCM grace). A `cloud-boothook` lays down a kubelet `ExecStartPre` drop-in:
 ```bash
 # in the cloud-boothook
@@ -205,7 +218,7 @@ curl -sLfo /usr/local/bin/xrn-install "$XRN_URL" && chmod +x /usr/local/bin/xrn-
 mkdir -p /etc/systemd/system/kubelet.service.d
 cat > /etc/systemd/system/kubelet.service.d/99-xrn-patch.conf <<EOF
 [Service]
-ExecStartPre=/usr/local/bin/xrn-install patch --cluster-name main --cluster-region us-east-2 --cluster-account-role-arn arn:aws:iam::<cluster-acct>:role/XrnSatelliteNodeRole
+ExecStartPre=/usr/local/bin/xrn-install patch --cluster-name main --cluster-region us-east-2 --cluster-account-role-arn arn:aws:iam::<cluster-acct>:role/XrnSatelliteNodeRole --provider-id-format aws
 EOF
 systemctl daemon-reload
 ```
@@ -215,7 +228,9 @@ systemctl daemon-reload
 1. Assumes the cluster-account role for `eks:DescribeCluster` (the instance role can't see a
    cluster in another account).
 2. Sets `--cloud-provider=""`, `--hostname-override=<instance-id>`, topology labels, and
-   `providerID=eks-hybrid:///<cluster-region>/<cluster>/<instance-id>`.
+   `providerID=aws:///<az>/<instance-id>` (validated 2026-06-24: CCM does not reap this cross-account
+   with `--cloud-provider=""`; also lets a per-account CA manage the ASG. Pass
+   `--provider-id-format eks-hybrid` for the legacy format).
 3. Installs the AssumeRole credential helper (`/etc/kubernetes/xrn/get-cluster-token.sh`) and
    points the kubelet kubeconfig at it — kubelet authenticates by assuming the cluster-account
    role with session name = instance ID (so its identity is `system:node:<instance-id>`).
@@ -262,7 +277,7 @@ Template: `deploy/asg/userdata-cross-account.template.txt` (see `deploy/asg/READ
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Node registers then disappears after ~2 min (`DeletingNode`) | providerID not `eks-hybrid:///` before first kubelet start | Cross-account must use the `patch`/`ExecStartPre` flow, not `init`. Check `/var/log/xrn-boothook.log` and `journalctl -u kubelet`. |
+| Node registers then disappears after ~2 min (`DeletingNode`) | kubelet started with `--cloud-provider=external` (not `""`) before the patch ran | Cross-account must use the `patch`/`ExecStartPre` flow, not `init`, so `--cloud-provider=""` is set before first kubelet start. Check `/var/log/xrn-boothook.log` and `journalctl -u kubelet`. (Reaping is prevented by `--cloud-provider=""`, not the providerID format.) |
 | `xrn-install patch`: `ResourceNotFoundException: No cluster found` | Missing/incorrect `--cluster-account-role-arn` (discovery ran with the satellite-account instance role) | Pass the cluster-account role ARN; ensure the instance role can assume it. |
 | satellite `aws-node` pod `InvalidTokenException` on EC2 calls | pod is using cluster-account creds (Pod Identity) | Confirm it's the dedicated `aws-node-satellite-*` DS (its SA has no Pod Identity association), not stock `aws-node`. |
 | `add-satellite`: `InvalidVpcID.NotFound` | cross-account VPC lookup with cluster-account creds | Pass `--vpc-cidr` explicitly (required when `--account-id` is set). |

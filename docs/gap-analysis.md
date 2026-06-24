@@ -234,6 +234,42 @@ New IAM API surface: `PutRolePolicy`, `UpdateAssumeRolePolicy`. New tests cover 
 grant, satellite-role create + trust refresh, and the trust-policy builder (with/without external
 id). The user guide and in-binary help were updated to match.
 
+## 5h. Cluster Autoscaler providerID incompatibility — found + fixed (2026-06-24, release v0.1.9)
+
+**Symptom:** CA churned the eu-west-1 satellite ASG (`cross-region-main-asg`) — launch a node,
+delete it ~15 min later, relaunch — and never autoscaled. Logs:
+`wrong id: expected format aws:///<zone>/<name>, got eks-hybrid:///us-east-2/main/i-...` and
+`Found longUnregistered Nodes [...]`. It *looked* like a recent regression but wasn't: CA had been
+down ~9 days, so nothing reaped or scaled; restarting it resumed a churn that was always latent.
+
+**Root cause:** CA's AWS provider matches an ASG instance to its Node by exact `providerID` string
+and only parses `aws:///<az>/<id>` (`AwsRefFromProviderId`, hard-coded regex — no config to extend
+it). Our `eks-hybrid:///` providerID never matches, so every satellite ASG instance is seen as
+never-registered → `longUnregistered` → deleted. No fork-free flag exists to make CA accept the
+hybrid format; the project's stance (kubernetes/autoscaler PRs #8047, #9801) is to *ignore* hybrid
+nodes, not autoscale them.
+
+**Fix (no CA fork):** `xrn-install` gained `--provider-id-format {eks-hybrid|aws}` (default
+`eks-hybrid`; pure `RenderProviderID`). Same-account userdata now passes `--provider-id-format aws`.
+
+**Validated end-to-end (2026-06-24):**
+- *Same-account (eu-west-1):* a node with `aws:///<az>/<id>` + `--cloud-provider=""` ran ~45 min
+  under an active CA with **no reap**, and CA issued `TriggeredScaleUp [{cross-region-main-asg 0->3}]`
+  → ASG scaled to 3, new `aws:///` nodes joined, pods scheduled. Scale-up + no-false-reap confirmed.
+- *Cross-account (us-west-1, account 310444902345):* a node launched with `aws:///` +
+  `--cloud-provider=""` joined and stayed Ready >10 min with **no `DeletingNode`**; its satellite
+  `aws-node` DS pod went 2/2 (IMDS creds). So `aws:///` is CCM-safe cross-account too — the
+  `eks-hybrid:///` prefix was never what prevented reaping; **`--cloud-provider=""` is.** The earlier
+  30s deletions were tied to `--cloud-provider=external`.
+- **Conclusion:** both topologies use `aws:///`. providerID is no longer a CA blocker in either case.
+- **Remaining cross-account constraint (not a providerID issue):** CA's AWS provider is
+  single-account/single-region per process, so the cluster's CA can't reach an ASG in another
+  account. Autoscaling a cross-account ASG requires a **second CA deployment** scoped to the
+  satellite account (`AWS_REGION=<sat-region>`, `--nodes`, satellite-account creds via Pod Identity
+  `targetRoleArn`). Not yet built/tested.
+- *Operational note:* a long-running CA pod cached a stale ASG model from the prior hybrid churn; a
+  CA restart was needed before it scaled the `aws:///` nodes.
+
 ## 6. Non-gaps (things the PRDs call for that ARE done)
 
 - ConfigMap as canonical registry (not SSM) — done, matches PRD §5 decision.
