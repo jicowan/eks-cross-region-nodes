@@ -240,7 +240,48 @@ CNI (and additionally requires a forked, renamed driver to run per-account). Nod
 (`iamRoleArnToAssume`) target groups. The auto-provision-from-annotations path is single-VPC only.
 See [load-balancing.md](./load-balancing.md).
 
-## 8. What this project does NOT change
+## 8. Pin cluster-critical add-ons to cluster-VPC nodes
+
+Satellite nodes are reachable from the control plane (and from cluster-region pods) only over the
+TGW — a longer, higher-latency, occasionally-flaky path. Any pod that the *cluster control plane or
+cluster-region workloads depend on* must therefore run on **cluster-VPC nodes**, never on satellite
+nodes. Schedule-anywhere add-ons will drift onto satellite nodes during scale events and create a
+fragile cross-region/cross-account dependency for a service that should be local.
+
+This is not hypothetical. Observed 2026-06-25: both CoreDNS replicas were scheduled onto a
+cross-account satellite node (us-west-1). Cluster-region DNS resolution then traversed the TGW to
+that node, and Cluster Autoscaler — running in the cluster region — could no longer resolve the
+`autoscaling.<region>.amazonaws.com` endpoint within its retry budget. CA fatally errored on startup
+(`Failed to create AWS Manager: ... dial tcp: lookup ... i/o timeout`) and crash-looped before it
+ever ran a scaling loop, so genuinely-Pending pods were never scaled. Rescheduling CoreDNS back onto
+cluster-VPC nodes immediately restored both DNS and autoscaling.
+
+**Recommendation:** give CoreDNS (and any other control-plane-adjacent add-on — Cluster Autoscaler,
+metrics-server, admission webhooks, operators) a nodeAffinity that **excludes satellite nodes**, so
+the scheduler can never place them there:
+
+```yaml
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: eks.amazonaws.com/compute-type
+          operator: NotIn
+          values: ["cross-region", "hybrid"]
+```
+
+Cluster Autoscaler already ships with this exclusion in `deploy/cluster-autoscaler/`. CoreDNS does
+**not** by default — patch the `coredns` Deployment (it has no nodeSelector/affinity out of the box,
+so it is free to land on satellite nodes). The single CA replica is especially sensitive: it both
+must run in the cluster region (to reach regional AWS APIs with cluster-account creds) and must
+resolve DNS locally, so a satellite-hosted CoreDNS takes it down.
+
+(A per-node DNS cache such as NodeLocal DNSCache would reduce satellite nodes' sensitivity to TGW
+latency for *their own* lookups, but it does not remove this requirement — a cache miss still
+forwards to central CoreDNS, wherever it runs. Tracked as a future improvement.)
+
+## 9. What this project does NOT change
 
 - The VPC CNI's IPAM model (custom networking already does the right thing per-region).
 - The EKS-managed `aws-node` DaemonSet (left untouched; routing is via labels + stock exclusions).

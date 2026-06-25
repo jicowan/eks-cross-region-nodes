@@ -80,10 +80,34 @@ CA runs in the cluster region but the ASG is in the satellite region. The `AWS_R
 
 CA only manages **one** region per process. If you add ASGs in a third region, run a second CA Deployment with that region's `AWS_REGION` and a different `--nodes=...` value.
 
-## Pod placement
+## Pod placement — CA *and its dependencies* must run on cluster-VPC nodes
 
-CA runs on cluster-VPC nodes only — it has nodeAffinity that excludes satellite nodes
-(`eks.amazonaws.com/compute-type` in `cross-region`/`hybrid`). If CA were to land on a satellite node, a network blip or node failure could leave the ASG without a controller.
+CA runs on cluster-VPC nodes only — `cluster-autoscaler.yaml` sets a nodeAffinity that excludes
+satellite nodes (`eks.amazonaws.com/compute-type` in `cross-region`/`hybrid`). If CA landed on a
+satellite node, a network blip or node failure could leave the ASG without a controller.
+
+**This isn't enough on its own: anything CA depends on must also be on cluster-VPC nodes — most
+importantly CoreDNS.** CA runs in the cluster region and must resolve regional AWS endpoints
+(`autoscaling.<region>.amazonaws.com`, `ec2.<region>.amazonaws.com`). If DNS resolution has to
+traverse the TGW to a satellite node, those lookups can time out.
+
+> **Incident (2026-06-25).** Both CoreDNS replicas were scheduled onto a cross-account satellite
+> node (us-west-1) — the `coredns` Deployment ships with **no** nodeSelector/affinity, so the
+> scheduler is free to place it anywhere. Cluster-region DNS then traversed the TGW to that node,
+> and CA could no longer resolve `autoscaling.eu-west-1.amazonaws.com` within its retry budget. CA
+> **fatally errored on startup** (`Failed to create AWS Manager: ... dial tcp: lookup ...: i/o
+> timeout`) and crash-looped before running a single scaling loop — so genuinely-Pending pods were
+> never scaled. It looked like a CA bug; it was misplaced DNS. Rescheduling CoreDNS back onto
+> cluster-VPC nodes immediately restored both DNS and autoscaling.
+
+Pin CoreDNS (and any other control-plane-adjacent add-on — metrics-server, admission webhooks,
+operators) off satellite nodes with the same exclusion CA uses:
+
+```bash
+kubectl -n kube-system patch deploy coredns --type=strategic -p '{"spec":{"template":{"spec":{"affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"eks.amazonaws.com/compute-type","operator":"NotIn","values":["cross-region","hybrid"]}]}]}}}}}}}}'
+```
+
+See `docs/architecture.md` §8 for the full rationale.
 
 ## Apply
 
